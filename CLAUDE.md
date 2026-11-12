@@ -268,6 +268,9 @@ were handed and what counts as done. If you are setting up a world pack for your
 - **review**: 파일을 고치지 않고 검토 결과를 큐로 돌려준다.
 - 남의 폴더에 변경이 필요하면 직접 고치지 말고 OpenRig 큐로 소유자에게 요청한다.
 
+## 실행법
+- 환경 준비 `uv sync`, 테스트 실행 `uv run pytest` (개발 의존성은 루트 `pyproject.toml`·`uv.lock`, 추가·변경은 lead가 한다).
+
 ## 순서: 테스트 먼저(RED) → 구현(GREEN)
 1. lead가 요구사항·완료 조건·인터페이스를 정한다.
 2. test가 테스트를 쓰고 실패(RED)를 확인해 보고한다.

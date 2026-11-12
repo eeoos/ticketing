@@ -1,0 +1,236 @@
+openapi: 3.1.0
+info:
+  title: Ticketing API
+  version: 0.1.0
+  description: |
+    1차 범위(MVP) API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-04.
+    - 사용자 식별: 로그인 대신 `X-User-Id` 헤더(모의 사용자). 상태를 바꾸는 요청에만 필수.
+    - 좌석 상태: AVAILABLE → HELD → SOLD. 홀드는 5분 유효(`now >= expiresAt`이면 만료).
+      만료된 HELD는 조회 시 AVAILABLE로 보이고 다시 잡을 수 있다. SOLD는 다시 잡을 수 없다.
+    - 모의 결제: 예매 확정 요청 자체를 결제 성공으로 처리한다.
+    - 시각은 모두 UTC ISO 8601(date-time).
+
+paths:
+  /shows:
+    get:
+      operationId: listShows
+      summary: 공연 목록 (US-01)
+      description: 공연이 없으면 빈 배열을 200으로 반환한다. X-User-Id는 필요 없다.
+      responses:
+        "200":
+          description: 공연 목록
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Show"
+
+  /shows/{showId}/seats:
+    get:
+      operationId: getSeatMap
+      summary: 좌석맵 (US-02)
+      description: 공연의 모든 좌석과 현재 상태. 만료된 홀드는 AVAILABLE로 보인다. X-User-Id는 필요 없다.
+      parameters:
+        - $ref: "#/components/parameters/ShowId"
+      responses:
+        "200":
+          description: 좌석 목록
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Seat"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /seats/{seatId}/hold:
+    post:
+      operationId: holdSeat
+      summary: 좌석 하나를 5분 동안 잡기 (US-03)
+      description: |
+        AVAILABLE 좌석 또는 만료된 HELD 좌석만 잡을 수 있다.
+        같은 좌석에 동시에 요청하면 정확히 하나만 201을 받고 나머지는 409(SEAT_HELD)를 받는다.
+        본인이 이미 잡은(만료 전) 좌석을 다시 잡아도 409(SEAT_HELD)이며 만료 시각은 바뀌지 않는다.
+      parameters:
+        - $ref: "#/components/parameters/XUserId"
+        - $ref: "#/components/parameters/SeatId"
+      responses:
+        "201":
+          description: 홀드 성공. 좌석은 HELD가 된다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Hold"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            잡을 수 없는 좌석. `code`로 구분한다.
+            - SEAT_HELD: 다른(또는 같은) 사용자가 만료 전 홀드 중인 좌석
+            - SEAT_SOLD: 이미 판매된(SOLD) 좌석. SOLD는 만료되지 않으므로 언제나 거절된다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                held:
+                  value: { code: SEAT_HELD, message: 이미 잡힌 좌석입니다. }
+                sold:
+                  value: { code: SEAT_SOLD, message: 이미 판매된 좌석입니다. }
+
+  /bookings:
+    post:
+      operationId: confirmBooking
+      summary: 모의 결제로 예매 확정 (US-04)
+      description: 홀드한 본인이 만료 전에 요청할 때만 성공하고, 좌석은 SOLD가 된다.
+      parameters:
+        - $ref: "#/components/parameters/XUserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingRequest"
+      responses:
+        "201":
+          description: 예매 확정. 좌석은 SOLD가 된다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          description: 요청 본문이 잘못됨(seatId 누락 등). code=INVALID_REQUEST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          description: 다른 사용자가 홀드한 좌석. code=HOLD_NOT_OWNED. 좌석은 그대로 HELD다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            확정할 수 없는 좌석. `code`로 구분한다.
+            - NO_HOLD: 홀드되지 않은 AVAILABLE 좌석
+            - HOLD_EXPIRED: 홀드가 만료됨(좌석은 SOLD가 되지 않고 조회 시 AVAILABLE)
+            - SEAT_SOLD: 이미 판매된(SOLD) 좌석. 예매는 하나만 남는다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  parameters:
+    XUserId:
+      name: X-User-Id
+      in: header
+      required: true
+      description: 모의 사용자 식별자. 없거나 빈 값이면 401(UNAUTHENTICATED).
+      schema:
+        type: string
+        minLength: 1
+    ShowId:
+      name: showId
+      in: path
+      required: true
+      schema:
+        type: string
+    SeatId:
+      name: seatId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    Unauthenticated:
+      description: X-User-Id 헤더가 없음. code=UNAUTHENTICATED. 상태는 바뀌지 않는다.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: 공연 또는 좌석을 찾을 수 없음. code=NOT_FOUND
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Show:
+      type: object
+      required: [id, title, venue, startsAt]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        venue: { type: string }
+        startsAt: { type: string, format: date-time }
+
+    SeatStatus:
+      type: string
+      enum: [AVAILABLE, HELD, SOLD]
+
+    Seat:
+      type: object
+      required: [id, section, row, number, status]
+      properties:
+        id: { type: string }
+        section: { type: string }
+        row: { type: string }
+        number: { type: integer, minimum: 1 }
+        status:
+          $ref: "#/components/schemas/SeatStatus"
+          description: 만료된 홀드는 AVAILABLE로 보인다.
+
+    Hold:
+      type: object
+      required: [seatId, userId, expiresAt]
+      properties:
+        seatId: { type: string }
+        userId: { type: string }
+        expiresAt:
+          type: string
+          format: date-time
+          description: 홀드 시각 + 5분. 이 시각 이후(같은 시각 포함) 만료.
+
+    BookingRequest:
+      type: object
+      required: [seatId]
+      properties:
+        seatId: { type: string }
+
+    Booking:
+      type: object
+      required: [id, seatId, userId, createdAt]
+      properties:
+        id: { type: string }
+        seatId: { type: string }
+        userId: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - UNAUTHENTICATED
+            - INVALID_REQUEST
+            - NOT_FOUND
+            - SEAT_HELD
+            - SEAT_SOLD
+            - HOLD_NOT_OWNED
+            - NO_HOLD
+            - HOLD_EXPIRED
+        message: { type: string }
