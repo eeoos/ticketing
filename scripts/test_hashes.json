@@ -7,6 +7,7 @@
     "tests/api/test_us03_hold_seat.py": "005b8148f27ef43b2a8092d4b2e7d5434321d9c4ee24ff07aa5997da4e4450e3",
     "tests/api/test_us04_confirm_booking.py": "fe3bd8e0bddae531505e2cb1020088ebc465af9fcefe88d369e005fee4eab94a",
     "tests/contract/test_openapi.py": "fb4859fa060b7c75049ea82ce97001596bcea48ec15c0c06e3e393f41c9f01de",
+    "tests/test_capacity.py": "b48025404046ca4dd8e57027b4fe0028f3dfc0e652a4ba3e109dec2a1bce41e3",
     "tests/test_smoke.py": "09b57af9eb9c82a19795528b996df79f0a63afe8ae1c75b0ac38fc9b853aa6ad"
   }
 }
