@@ -37,8 +37,7 @@ def test_us02_ac3_expired_hold_shows_available(api):
 
 def test_us02_ac4_sold_seat_shows_sold(api):
     seat = api.first_seat()
-    assert api.hold(seat, user="A").status_code == 201
-    assert api.book(seat, user="A").status_code == 201
+    api.sell(seat, "A")  # 홀드 → 결제 요청 → SUCCEEDED 콜백
     seats = {s["id"]: s["status"] for s in api.seat_map()}
     assert seats[seat] == "SOLD"
     assert sum(v == "AVAILABLE" for v in seats.values()) == 99
@@ -53,3 +52,17 @@ def test_us02_contract_nul_in_show_id_is_404(api):
     api.show_id()
     assert_error(api.request("GET", "/shows/%00/seats"), 404, "NOT_FOUND")
     assert_error(api.request("GET", f"/shows/{api.show_id()}%00/seats"), 404, "NOT_FOUND")
+
+
+def test_us02_ac2_pending_payment_keeps_seat_held(api):
+    seat = api.first_seat()
+    api.hold_and_pay(seat, "A")  # 결제 요청만으로는 팔리지 않는다
+    assert api.status_of(seat) == "HELD"
+
+
+def test_us02_ac3_refund_required_late_success_shows_available(api):
+    seat = api.first_seat()
+    _, b = api.hold_and_pay(seat, "A")
+    api.now += HOLD
+    assert api.callback(b["paymentId"], "SUCCEEDED").json()["booking"]["status"] == "REFUND_REQUIRED"
+    assert api.status_of(seat) == "AVAILABLE"

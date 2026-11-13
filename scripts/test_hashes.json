@@ -1,16 +1,17 @@
 {
   "files": {
-    "tests/api/api_support.py": "d4843cd68820bf8c2c2c38f32d75cc5e996bd6b9e84bbf21d9eebff094f794e1",
-    "tests/api/conftest.py": "e871292091f80b6559489804725a3208ef1ed82fc168696ff2f311d117bc22d9",
+    "tests/api/api_support.py": "340fbb6bf3bd33f9252204ed6071c68ad9029f65f563ee527205483ddfe0ad7f",
+    "tests/api/conftest.py": "920946bd9788f5ef98239e7ce51b2551fafa76687165b71635c223e34c0c44f0",
     "tests/api/test_db_interface.py": "e3e91b9cf959eeb32f808354ea29c72149accedd9dc25e2f7780876977318467",
     "tests/api/test_us01_list_shows.py": "ba82b51aefd6db1b9a9b31171d1dc166349fc5d1a44ed0f43dced1d0a09f5cab",
-    "tests/api/test_us02_seat_map.py": "5f758a1dfd71b8c624fab023480331ba5dafbb16bad2890af5a734c201668b28",
-    "tests/api/test_us03_hold_seat.py": "005b8148f27ef43b2a8092d4b2e7d5434321d9c4ee24ff07aa5997da4e4450e3",
-    "tests/api/test_us04_confirm_booking.py": "fe3bd8e0bddae531505e2cb1020088ebc465af9fcefe88d369e005fee4eab94a",
-    "tests/concurrency/concurrency_support.py": "2313e03c9d0087dc671dfe9010d441df76d162d248f6ba6950cf32cabef0d7d4",
+    "tests/api/test_us02_seat_map.py": "059fd492a4febc7e5c33563aa7dcb8964373860dc7cd92702558c7354a9ebe86",
+    "tests/api/test_us03_hold_seat.py": "5dcd61cdfbb0b5ad78664a2bac7f57ae7bdc268e7a35a43c2d6c255de56198fc",
+    "tests/api/test_us04_payment_request.py": "e3ea3d6fef3c110754135d0510b5ec68cb4d02fc198f4dc7e4a839b43fb2c57f",
+    "tests/api/test_us05_payment_callback.py": "71f02323675cdfd2dc42c29f8b3cb2d00832ebc29622ebf22dbcef276f9c3b46",
+    "tests/concurrency/concurrency_support.py": "dea81b7f17e9dc2c295e635d66d14a2facd5ca65a6047059a00713dc07384fe6",
     "tests/concurrency/conftest.py": "ac049bfb81f4d097b2266947f3c808c8c63c5aba28173265f66690e6a8cddb50",
-    "tests/concurrency/test_concurrent_seat.py": "5a85ec7e109803eb5512e0e0b41b569aef09d25c4e33260392777a641e9fd033",
-    "tests/contract/test_openapi.py": "fb4859fa060b7c75049ea82ce97001596bcea48ec15c0c06e3e393f41c9f01de",
+    "tests/concurrency/test_concurrent_seat.py": "edb795c347ef14f732ff01d1a0b546ca5b908ab247e5c7637666034b08619c57",
+    "tests/contract/test_openapi.py": "cb0e71d31d89036307c3f9abff068731319ddff0c5119f7c5a40dd49b02e094d",
     "tests/test_capacity.py": "b48025404046ca4dd8e57027b4fe0028f3dfc0e652a4ba3e109dec2a1bce41e3",
     "tests/test_smoke.py": "09b57af9eb9c82a19795528b996df79f0a63afe8ae1c75b0ac38fc9b853aa6ad"
   }

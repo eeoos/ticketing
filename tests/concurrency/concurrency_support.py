@@ -4,6 +4,9 @@
 겹침 증거(HTTP 최대 동시 진행 수, pg active 최댓값, 서로 다른 application_name 수)를 모은다.
 """
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 import socket
 import subprocess
@@ -24,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DSN = "postgresql://ticketing:ticketing@localhost:5432/ticketing_concurrency"
 DEV_DB_NAME = "ticketing"
 WORKERS = 4
+MOCK_PG_SECRET = os.environ.get("MOCK_PG_SECRET", "mock-pg-dev-secret")  # 테스트와 하위 uvicorn 이 같은 값을 쓴다
 APP_NAME_PREFIX = "ticketing-api-"
 
 
@@ -75,7 +79,7 @@ class Server:
         self.proc = None
 
     def start(self, timeout=60):
-        env = dict(os.environ, DATABASE_URL=self.dsn)
+        env = dict(os.environ, DATABASE_URL=self.dsn, MOCK_PG_SECRET=MOCK_PG_SECRET)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "backend.main:app", "--workers", str(WORKERS),
              "--host", "127.0.0.1", "--port", str(self.port), "--log-level", "warning"],
@@ -171,6 +175,7 @@ class Result:
     start: float
     end: float
     error: str | None = None
+    headers: object = field(default_factory=dict)
 
     @property
     def code(self):
@@ -191,11 +196,11 @@ class Run:
     notes: list[str] = field(default_factory=list)
 
     def status_counts(self):
-        c = Counter()
-        for r in self.results:
-            s = r.status
-            c["error" if s is None else "5xx" if s >= 500 else s if s in (201, 409) else "other"] += 1
-        return dict(c)
+        """실제 HTTP 상태 코드별 개수. 응답이 없으면(연결 오류 등) 'error'. 5xx 도 실제 코드 그대로 센다."""
+        return dict(Counter("error" if r.status is None else r.status for r in self.results))
+
+    def count_5xx_or_error(self):
+        return sum(1 for r in self.results if r.status is None or r.status >= 500)
 
     def code_409_counts(self):
         return dict(Counter(r.code for r in self.results if r.status == 409))
@@ -223,13 +228,14 @@ def _max_inflight(results: list[Result]) -> int:
     return best
 
 
-async def _fire(server_url: str, requests: list[dict]) -> list[Result]:
+async def _fire(server_url: str, requests: list) -> list[Result]:
+    """requests 원소: 요청 dict 한 건, 또는 async 함수 fn(call) — 한 클라이언트가 여러 요청을 순서대로 보내는 흐름.
+    모든 태스크는 같은 시작 신호(배리어) 뒤에 출발한다. 반환은 모든 요청의 Result 를 편 목록."""
     n = len(requests)
     limits = httpx.Limits(max_connections=n + 50, max_keepalive_connections=n + 50)
     gate = asyncio.Event()
     async with httpx.AsyncClient(base_url=server_url, limits=limits, timeout=httpx.Timeout(120)) as client:
-        async def one(spec) -> Result:
-            await gate.wait()
+        async def call(spec, out) -> Result:
             start = time.perf_counter()
             try:
                 resp = await client.request(**spec)
@@ -237,14 +243,27 @@ async def _fire(server_url: str, requests: list[dict]) -> list[Result]:
                     body = resp.json()
                 except ValueError:
                     body = resp.text
-                return Result(resp.status_code, body, start, time.perf_counter())
+                res = Result(resp.status_code, body, start, time.perf_counter())
+                res.headers = resp.headers
             except httpx.HTTPError as e:
-                return Result(None, None, start, time.perf_counter(), error=f"{type(e).__name__}: {e}")
+                res = Result(None, None, start, time.perf_counter(), error=f"{type(e).__name__}: {e}")
+                res.headers = {}
+            out.append(res)
+            return res
+
+        async def one(spec) -> list[Result]:
+            await gate.wait()
+            out: list[Result] = []
+            if callable(spec):
+                await spec(lambda **kw: call(kw, out))
+            else:
+                await call(spec, out)
+            return out
 
         tasks = [asyncio.create_task(one(s)) for s in requests]
         await asyncio.sleep(0.5)  # 모든 태스크가 배리어에서 대기하도록
         gate.set()  # 시작 신호
-        return await asyncio.gather(*tasks)
+        return [r for group in await asyncio.gather(*tasks) for r in group]
 
 
 def run_concurrently(server: Server, dsn: str, requests: list[dict]) -> Run:
@@ -258,6 +277,38 @@ def run_concurrently(server: Server, dsn: str, requests: list[dict]) -> Run:
     return Run(results, _max_inflight(results), sampler.max_active, sampler.max_sessions,
                len(sampler.app_names), sorted(sampler.app_names), sampler.samples, sampler.error,
                sorted(sampler.worked_names))
+
+
+def sign(raw: bytes) -> str:
+    return hmac.new(MOCK_PG_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+
+
+def callback_request(payment_id: str, result: str) -> dict:
+    raw = json.dumps({"paymentId": payment_id, "result": result}).encode()
+    return dict(method="POST", url="/payments/callback", content=raw,
+                headers={"Content-Type": "application/json", "X-Mock-Pg-Signature": sign(raw)})
+
+
+def sync_post(server: Server, path: str, user: str | None = None, **kw):
+    headers = dict(kw.pop("headers", {}))
+    if user:
+        headers["X-User-Id"] = user
+    return httpx.post(server.url + path, headers=headers, timeout=30, **kw)
+
+
+def hold_and_pay(server: Server, seat_id: str, user: str, key: str = "setup-key"):
+    """(순차) 홀드 → 결제 요청. 202 를 확인하고 (hold, booking) 본문을 돌려준다."""
+    h = sync_post(server, f"/seats/{seat_id}/hold", user)
+    assert h.status_code == 201, h.text
+    b = sync_post(server, "/bookings", user, json={"seatId": seat_id}, headers={"Idempotency-Key": key})
+    assert b.status_code == 202, b.text
+    return h.json(), b.json()
+
+
+def bookings_of(dsn: str, seat_id: str):
+    with psycopg.connect(dsn) as conn:
+        return conn.execute("SELECT id, user_id, status FROM bookings WHERE seat_id = %s ORDER BY created_at, id",
+                            (seat_id,)).fetchall()
 
 
 def sync_get(server: Server, path: str):

@@ -3,8 +3,12 @@
 backend 가 없으면 테스트마다 AssertionError 하나로 개별 실패한다(수집 오류로 뭉치지 않음).
 약속: docs/backend-interface.md
 """
+import hashlib
+import hmac
+import json as jsonlib
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -14,6 +18,8 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 TEST_DSN = os.environ.get("TEST_DATABASE_URL", "postgresql://ticketing:ticketing@localhost:5432/ticketing_test")
 T0 = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 HOLD = timedelta(minutes=5)
+MOCK_PG_SECRET = os.environ.get("MOCK_PG_SECRET", "mock-pg-dev-secret")
+NO_KEY = object()  # Idempotency-Key 헤더를 보내지 않는다
 
 
 def parse_dt(value: str) -> datetime:
@@ -104,9 +110,49 @@ class Api:
     def hold(self, seat_id, user=None, client=None):
         return self.request("POST", f"/seats/{seat_id}/hold", user=user, client=client)
 
-    def book(self, seat_id, user=None, json=None):
+    def pay(self, seat_id, user=None, key=None, json=None, headers=None, client=None):
+        """POST /bookings. key=None 이면 새 키를 만들고, key=NO_KEY 면 헤더를 보내지 않는다."""
+        h = dict(headers or {})
+        if key is None:
+            key = f"key-{uuid.uuid4()}"
+        if key is not NO_KEY:
+            h["Idempotency-Key"] = key
         body = {"seatId": seat_id} if json is None else json
-        return self.request("POST", "/bookings", user=user, json=body)
+        return self.request("POST", "/bookings", user=user, client=client, json=body, headers=h)
+
+    def get_booking(self, booking_id, user=None):
+        return self.request("GET", f"/bookings/{booking_id}", user=user)
+
+    @staticmethod
+    def sign(raw: bytes, secret: str = MOCK_PG_SECRET) -> str:
+        return hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+
+    def callback(self, payment_id, result, body=None, signature="valid", client=None):
+        """POST /payments/callback. 본문 원문 바이트에 서명한다. signature: 'valid' | None(헤더 없음) | 문자열."""
+        payload = {"paymentId": payment_id, "result": result} if body is None else body
+        raw = payload if isinstance(payload, bytes) else jsonlib.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+        if signature == "valid":
+            headers["X-Mock-Pg-Signature"] = self.sign(raw)
+        elif signature is not None:
+            headers["X-Mock-Pg-Signature"] = signature
+        return self.request("POST", "/payments/callback", client=client, content=raw, headers=headers)
+
+    def hold_and_pay(self, seat_id, user, key=None):
+        """홀드 → 결제 요청(202). (hold 본문, booking 본문)을 돌려준다."""
+        h = self.hold(seat_id, user=user)
+        assert h.status_code == 201, h.text
+        p = self.pay(seat_id, user=user, key=key)
+        assert p.status_code == 202, p.text
+        return h.json(), p.json()
+
+    def sell(self, seat_id, user):
+        """홀드 → 결제 요청 → SUCCEEDED 콜백으로 좌석을 SOLD 로 만든다. 확정된 예매 본문을 돌려준다."""
+        _, b = self.hold_and_pay(seat_id, user)
+        r = self.callback(b["paymentId"], "SUCCEEDED")
+        assert r.status_code == 200 and r.json()["applied"] is True, r.text
+        assert r.json()["booking"]["status"] == "CONFIRMED", r.text
+        return r.json()["booking"]
 
     def first_seat(self):
         return self.seat_ids()[0]
@@ -134,6 +180,32 @@ class Api:
                     (f"추가 공연 {i + 1}", f"추가 장소 {i + 1}", T0 + timedelta(days=i + 1))).fetchone()
                 rows.append(row)
         return rows
+
+    def check_invariants(self):
+        """DB 불변식 5: 좌석 SOLD ⇔ 그 좌석의 CONFIRMED 예매가 정확히 하나. (불변식 1: CONFIRMED 는 좌석당 최대 하나)"""
+        self._ensure()
+        with psycopg.connect(TEST_DSN) as conn:
+            has_status = conn.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'status'"
+            ).fetchone()
+            if not has_status:  # 새 스키마(마이그레이션 002)가 아직 없다 — 불변식을 물어볼 수 없다(구현 전 RED 상태)
+                return
+            multi = conn.execute("SELECT seat_id, count(*) FROM bookings WHERE status = 'CONFIRMED' "
+                                 "GROUP BY seat_id HAVING count(*) > 1").fetchall()
+            assert not multi, f"좌석당 CONFIRMED 예매가 둘 이상: {multi}"
+            bad = conn.execute(
+                "SELECT s.id, s.status, (SELECT count(*) FROM bookings b WHERE b.seat_id = s.id AND b.status = 'CONFIRMED') "
+                "FROM seats s WHERE (s.status = 'SOLD') <> EXISTS "
+                "(SELECT 1 FROM bookings b WHERE b.seat_id = s.id AND b.status = 'CONFIRMED')").fetchall()
+            assert not bad, f"SOLD ⇔ CONFIRMED 1건 불변식 위반(좌석, 상태, CONFIRMED 수): {bad}"
+
+    def bookings_in_db(self, seat_id=None):
+        self._ensure()
+        with psycopg.connect(TEST_DSN) as conn:
+            q = "SELECT id, seat_id, user_id, status FROM bookings"
+            if seat_id:
+                return conn.execute(q + " WHERE seat_id = %s ORDER BY created_at, id", (seat_id,)).fetchall()
+            return conn.execute(q + " ORDER BY created_at, id").fetchall()
 
     def booking_count(self):
         self._ensure()

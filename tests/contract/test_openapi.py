@@ -7,8 +7,8 @@ scripts/story_report.py 가 이 이름으로 스토리별 통과표를 만든다
   US-01 목록      GET  .../shows
   US-02 좌석맵    GET  .../shows/{id}/(seats|seat-map|seatmap)
   US-03 홀드      POST .../hold
-  US-04 예매확정  POST .../(bookings|booking|confirm|purchase|pay|payment)
-필드 이름은 흔한 동의어(대소문자·_ 무시)를 허용한다.
+  US-01·US-02: 흔한 동의어(대소문자·_ 무시)를 허용한다(6장에서 바뀌지 않은 부분).
+  US-03~US-05(6장 계약): 경로·헤더·필드·오류 code 를 openapi.yaml(v0.2.0)의 이름 그대로 단언한다.
 행동(동시성·만료 경과)은 계약 파일로 검증할 수 없어 e2e/구현 테스트에서 다룬다.
 """
 from pathlib import Path
@@ -188,83 +188,201 @@ def test_us02_ac5_unknown_show_is_404():
     assert "404" in responses(spec, op), "없는 공연에 대한 404 가 정의돼 있지 않다"
 
 
+# ---------- 6장 계약: 이름 그대로 ----------
+def path_op(spec, path, method):
+    item = resolve(spec, spec["paths"].get(path))
+    assert item is not None, f"경로 {path} 가 계약에 없다"
+    assert method in item, f"{method.upper()} {path} 가 계약에 없다"
+    return item, resolve(spec, item[method])
+
+
+def header_param(spec, item, op, name):
+    for p in params(spec, item, op):
+        if p.get("in") == "header" and p.get("name") == name:
+            return p
+    return None
+
+
+def schema_named(spec, name):
+    node = spec["components"]["schemas"].get(name)
+    assert node is not None, f"components.schemas.{name} 가 없다"
+    return resolve(spec, node)
+
+
+def error_enum(spec):
+    return set(schema_named(spec, "Error")["properties"]["code"]["enum"])
+
+
+def schema_of(spec, resp):
+    return body_schema(spec, resp)
+
+
 # ---------- US-03 홀드 ----------
-def test_us03_ac1_hold_success_has_expiry():
+def test_us03_ac1_hold_success_201_has_hold_id_seat_user_and_expires_at():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", HOLD)
-    ok = success(spec, op)
-    schema = body_schema(spec, next(iter(ok.values())))
-    assert has_any(props(spec, schema), *EXPIRES), f"홀드 응답에 만료 시각이 없다: {sorted(props(spec, schema))}"
+    item, op = path_op(spec, "/seats/{seatId}/hold", "post")
+    ok = responses(spec, op)
+    assert "201" in ok
+    schema = schema_of(spec, ok["201"])
+    assert {"holdId", "seatId", "userId", "expiresAt"} <= set(props(spec, schema)), sorted(props(spec, schema))
+    assert set(schema.get("required", [])) >= {"holdId", "seatId", "userId", "expiresAt"}
+    assert props(spec, schema)["expiresAt"].get("format") == "date-time"
 
 
-def test_us03_ac2_ac3_ac6_seat_already_held_is_409():
+def test_us03_ac2_ac3_ac6_seat_already_held_is_409_seat_held():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", HOLD)
-    assert "409" in responses(spec, op), "이미 잡힌 좌석(409)이 정의돼 있지 않다"
-
-
-def test_us03_ac5_sold_seat_is_conflict_documented():
-    spec = load_spec()
-    _, _, op = get_op(spec, "post", HOLD)
+    _, op = path_op(spec, "/seats/{seatId}/hold", "post")
     r = responses(spec, op).get("409")
-    assert r is not None, "이미 판매된 좌석(409)이 정의돼 있지 않다"
-    text = (r.get("description") or "") + str(r.get("content") or "")
-    assert any(w in text for w in ("SOLD", "판매", "sold")), \
-        "409 응답에 '이미 잡힘'과 '이미 판매됨'을 구분할 설명/오류코드가 없다"
+    assert r is not None, "이미 잡힌 좌석(409)이 정의돼 있지 않다"
+    assert "SEAT_HELD" in str(r), "409 에 SEAT_HELD 설명이 없다"
 
 
-def test_us03_ac7_hold_requires_user_header_and_has_401_or_400():
+def test_us03_ac5_sold_seat_is_409_seat_sold():
     spec = load_spec()
-    path, item, op = get_op(spec, "post", HOLD)
-    header = user_header(spec, item, op)
+    _, op = path_op(spec, "/seats/{seatId}/hold", "post")
+    assert "SEAT_SOLD" in str(responses(spec, op).get("409")), "409 에 SEAT_SOLD 설명이 없다"
+
+
+def test_us03_ac7_hold_requires_x_user_id_and_has_401():
+    spec = load_spec()
+    item, op = path_op(spec, "/seats/{seatId}/hold", "post")
+    header = header_param(spec, item, op, "X-User-Id")
     assert header and header.get("required") is True, "홀드에 required X-User-Id 헤더가 없다"
-    assert error_codes(spec, op) & {"400", "401"}, "사용자 식별 필요 오류(400/401)가 없다"
+    assert "401" in responses(spec, op), "사용자 식별 필요(401)가 없다"
 
 
 def test_us03_ac8_unknown_seat_is_404():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", HOLD)
-    assert "404" in responses(spec, op), "없는 좌석에 대한 404 가 정의돼 있지 않다"
+    _, op = path_op(spec, "/seats/{seatId}/hold", "post")
+    assert "404" in responses(spec, op)
 
 
-# ---------- US-04 예매 확정 ----------
-def test_us04_ac1_confirm_success_has_booking_seat_user():
+def test_us03_ac9_ac10_hold_description_states_new_hold_id_and_no_extension():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", CONFIRM)
-    ok = success(spec, op)
-    schema = body_schema(spec, next(iter(ok.values())))
-    require_fields(props(spec, schema), "예매 응답",
-                   [("id", "bookingId"), ("seatId", "seat"), ("userId", "user")])
+    _, op = path_op(spec, "/seats/{seatId}/hold", "post")
+    text = op.get("description", "")
+    assert "holdId" in text and "연장" in text, "홀드 설명에 새 holdId 발급과 연장 없음이 없다"
 
 
-def test_us04_ac2_not_my_hold_is_403():
+# ---------- US-04 결제 요청 ----------
+def test_us04_ac1_post_bookings_requires_user_and_idempotency_key_headers():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", CONFIRM)
-    assert "403" in responses(spec, op), "본인 홀드 아님(403)이 정의돼 있지 않다"
+    item, op = path_op(spec, "/bookings", "post")
+    user = header_param(spec, item, op, "X-User-Id")
+    key = header_param(spec, item, op, "Idempotency-Key")
+    assert user and user.get("required") is True
+    assert key and key.get("required") is True, "Idempotency-Key 헤더가 required 가 아니다"
+    assert key["schema"].get("minLength") == 1 and key["schema"].get("maxLength") == 255
 
 
-def test_us04_ac3_ac4_expired_or_missing_hold_is_rejected():
+def test_us04_ac1_success_is_202_pending_booking_with_all_fields():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", CONFIRM)
-    assert error_codes(spec, op) & {"409", "410"}, "홀드 만료/홀드 없음 오류(409/410)가 없다"
+    _, op = path_op(spec, "/bookings", "post")
+    ok = responses(spec, op)
+    assert "202" in ok, "결제 요청 성공은 202 여야 한다"
+    schema = schema_of(spec, ok["202"])
+    required = {"id", "seatId", "userId", "status", "paymentId", "holdId", "holdExpiresAt", "createdAt", "updatedAt"}
+    assert required <= set(props(spec, schema)), sorted(props(spec, schema))
+    assert required <= set(schema.get("required", []))
+    assert "Idempotent-Replayed" in (ok["202"].get("headers") or {}), "202 에 Idempotent-Replayed 헤더 정의가 없다"
 
 
-def test_us04_ac5_already_sold_is_409():
+def test_us04_ac1_booking_status_enum_is_exactly_the_four_states():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", CONFIRM)
-    assert "409" in responses(spec, op), "이미 판매된 좌석(409)이 정의돼 있지 않다"
+    assert set(schema_named(spec, "BookingStatus")["enum"]) == {"PENDING", "CONFIRMED", "FAILED", "REFUND_REQUIRED"}
 
 
-def test_us04_ac6_hold_on_sold_seat_stays_rejected_in_contract():
-    # SOLD 는 만료되지 않는다: 홀드 계약이 SOLD 거절(409)을 가진다 (행동 검증은 e2e).
+def test_us04_ac9_confirmed_own_booking_is_200():
     spec = load_spec()
-    _, _, op = get_op(spec, "post", HOLD)
-    assert "409" in responses(spec, op)
+    _, op = path_op(spec, "/bookings", "post")
+    assert "200" in responses(spec, op), "이미 확정된 본인 예매(200)가 정의돼 있지 않다"
 
 
-def test_us04_ac7_confirm_requires_user_header_and_has_401_or_400():
+def test_us04_ac3_not_my_hold_is_403():
     spec = load_spec()
-    path, item, op = get_op(spec, "post", CONFIRM)
-    header = user_header(spec, item, op)
-    assert header and header.get("required") is True, "예매 확정에 required X-User-Id 헤더가 없다"
-    assert error_codes(spec, op) & {"400", "401"}, "사용자 식별 필요 오류(400/401)가 없다"
+    _, op = path_op(spec, "/bookings", "post")
+    assert "403" in responses(spec, op) and "HOLD_NOT_OWNED" in str(responses(spec, op)["403"])
+
+
+def test_us04_ac2_ac5_ac7_ac10_ac11_conflict_codes_are_documented():
+    spec = load_spec()
+    _, op = path_op(spec, "/bookings", "post")
+    text = str(responses(spec, op).get("409"))
+    for code in ("IDEMPOTENCY_KEY_MISMATCH", "SEAT_SOLD", "NO_HOLD", "HOLD_EXPIRED", "PAYMENT_IN_PROGRESS"):
+        assert code in text, f"409 에 {code} 설명이 없다"
+
+
+def test_us04_ac12_invalid_request_unauthenticated_and_not_found_are_defined():
+    spec = load_spec()
+    _, op = path_op(spec, "/bookings", "post")
+    r = responses(spec, op)
+    assert {"400", "401", "404"} <= set(r), sorted(r)
+    assert "INVALID_REQUEST" in str(r["400"])
+
+
+def test_us04_ac14_get_booking_defined_for_owner_with_404_and_401():
+    spec = load_spec()
+    item, op = path_op(spec, "/bookings/{bookingId}", "get")
+    header = header_param(spec, item, op, "X-User-Id")
+    assert header and header.get("required") is True
+    r = responses(spec, op)
+    assert {"200", "401", "404"} <= set(r), sorted(r)
+    schema = schema_of(spec, r["200"])
+    assert {"id", "status", "paymentId", "holdId"} <= set(props(spec, schema))
+
+
+# ---------- US-05 콜백 ----------
+def test_us05_ac9_callback_requires_signature_header_not_user_header():
+    spec = load_spec()
+    item, op = path_op(spec, "/payments/callback", "post")
+    sig = header_param(spec, item, op, "X-Mock-Pg-Signature")
+    assert sig and sig.get("required") is True, "X-Mock-Pg-Signature 가 required 헤더가 아니다"
+    assert header_param(spec, item, op, "X-User-Id") is None, "콜백이 X-User-Id 를 요구하면 안 된다"
+
+
+def test_us05_ac1_callback_request_body_is_payment_id_and_result_enum():
+    spec = load_spec()
+    _, op = path_op(spec, "/payments/callback", "post")
+    schema = resolve(spec, op["requestBody"]["content"]["application/json"]["schema"])
+    assert set(schema.get("required", [])) >= {"paymentId", "result"}
+    assert set(props(spec, schema)["result"]["enum"]) == {"SUCCEEDED", "FAILED"}
+
+
+def test_us05_ac4_callback_success_response_has_applied_and_booking():
+    spec = load_spec()
+    _, op = path_op(spec, "/payments/callback", "post")
+    schema = schema_of(spec, responses(spec, op)["200"])
+    assert {"applied", "booking"} <= set(props(spec, schema))
+    assert props(spec, schema)["applied"].get("type") == "boolean"
+
+
+def test_us05_ac5_ac7_ac9_callback_error_responses_are_defined():
+    spec = load_spec()
+    _, op = path_op(spec, "/payments/callback", "post")
+    r = responses(spec, op)
+    assert {"400", "401", "404", "409"} <= set(r), sorted(r)
+    assert "INVALID_SIGNATURE" in str(r["401"])
+    assert "CALLBACK_CONFLICT" in str(r["409"])
+
+
+def test_us05_ac2_ac6_callback_description_states_state_table_and_server_clock():
+    spec = load_spec()
+    _, op = path_op(spec, "/payments/callback", "post")
+    text = op.get("description", "")
+    for word in ("REFUND_REQUIRED", "CONFIRMED", "get_now", "HMAC-SHA256", "MOCK_PG_SECRET"):
+        assert word in text, f"콜백 설명에 {word} 가 없다"
+
+
+# ---------- 공통: 오류 code enum ----------
+def test_us04_ac12_error_code_enum_has_all_new_codes():
+    spec = load_spec()
+    expected = {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD", "HOLD_NOT_OWNED",
+                "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH", "PAYMENT_IN_PROGRESS",
+                "INVALID_SIGNATURE", "CALLBACK_CONFLICT"}
+    assert error_enum(spec) == expected, sorted(error_enum(spec) ^ expected)
+
+
+def test_us04_ac1_old_confirm_flow_is_gone_bookings_201_not_defined():
+    spec = load_spec()
+    _, op = path_op(spec, "/bookings", "post")
+    assert "201" not in responses(spec, op), "결제 요청이 옛 방식(201 바로 확정)으로 남아 있다"

@@ -1,13 +1,16 @@
 openapi: 3.1.0
 info:
   title: Ticketing API
-  version: 0.1.0
+  version: 0.2.0
   description: |
-    1차 범위(MVP) API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-04.
-    - 사용자 식별: 로그인 대신 `X-User-Id` 헤더(모의 사용자). 상태를 바꾸는 요청에만 필수.
-    - 좌석 상태: AVAILABLE → HELD → SOLD. 홀드는 5분 유효(`now >= expiresAt`이면 만료).
-      만료된 HELD는 조회 시 AVAILABLE로 보이고 다시 잡을 수 있다. SOLD는 다시 잡을 수 없다.
-    - 모의 결제: 예매 확정 요청 자체를 결제 성공으로 처리한다.
+    MVP API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-05,
+    예매·좌석 상태 전이와 DB 불변식은 docs/backend-interface.md.
+    - 사용자 식별: 로그인 대신 `X-User-Id` 헤더(모의 사용자).
+    - 좌석 상태: AVAILABLE → HELD → SOLD. 홀드는 5분 유효(`now >= expiresAt`이면 만료), 연장·직접 해제 없음.
+      만료된 HELD는 조회 시 AVAILABLE로 보이고 누구든(본인 포함) 새로 잡을 수 있다(새 holdId). SOLD는 다시 잡을 수 없다.
+    - 결제는 두 단계: `POST /bookings`(PENDING 생성, 멱등) → 모의 결제사 `POST /payments/callback`(성공·실패).
+    - 모든 만료 판단은 서버 시각(get_now)으로 한다. 클라이언트나 콜백이 보낸 시각은 쓰지 않는다.
+    - 가격·등급은 범위 밖이다(금액 필드 없음).
     - 시각은 모두 UTC ISO 8601(date-time).
 
 paths:
@@ -50,9 +53,9 @@ paths:
       operationId: holdSeat
       summary: 좌석 하나를 5분 동안 잡기 (US-03)
       description: |
-        AVAILABLE 좌석 또는 만료된 HELD 좌석만 잡을 수 있다.
+        AVAILABLE 좌석 또는 만료된 HELD 좌석만 잡을 수 있다. 성공할 때마다 새 holdId가 발급된다.
         같은 좌석에 동시에 요청하면 정확히 하나만 201을 받고 나머지는 409(SEAT_HELD)를 받는다.
-        본인이 이미 잡은(만료 전) 좌석을 다시 잡아도 409(SEAT_HELD)이며 만료 시각은 바뀌지 않는다.
+        본인이 이미 잡은(만료 전) 좌석을 다시 잡아도 409(SEAT_HELD)이며 holdId와 만료 시각은 바뀌지 않는다(연장 없음).
       parameters:
         - $ref: "#/components/parameters/XUserId"
         - $ref: "#/components/parameters/SeatId"
@@ -84,11 +87,33 @@ paths:
 
   /bookings:
     post:
-      operationId: confirmBooking
-      summary: 모의 결제로 예매 확정 (US-04)
-      description: 홀드한 본인이 만료 전에 요청할 때만 성공하고, 좌석은 SOLD가 된다.
+      operationId: requestPayment
+      summary: 결제 요청 — PENDING 예매 생성 (US-04)
+      description: |
+        본인의 유효한 홀드로 결제를 요청한다. 예매는 PENDING으로 만들어지고 그 시점의 holdId에 묶인다.
+        좌석은 아직 HELD이며, 모의 결제사의 SUCCEEDED 콜백이 홀드 유효 시간 안에 와야 SOLD가 된다.
+
+        판정 순서(위에서 먼저 걸리는 것이 응답):
+        1. X-User-Id 없음 → 401 UNAUTHENTICATED
+        2. Idempotency-Key 없음·빈 값·NUL 포함·255자 초과, 또는 본문 오류 → 400 INVALID_REQUEST
+        3. (X-User-Id, Idempotency-Key)로 저장된 응답이 있으면:
+           - 같은 요청(정규화한 본문 {seatId} 동일) → 최초 응답을 그대로 재현(같은 상태 코드·본문,
+             헤더 Idempotent-Replayed: true). 그 사이 예매가 확정·실패·만료됐어도 최초 응답 그대로다.
+           - 다른 요청 → 409 IDEMPOTENCY_KEY_MISMATCH
+        4. 좌석 없음 → 404 NOT_FOUND
+        5. 이 사용자의 CONFIRMED 예매가 이 좌석에 있으면 → 200 그 예매(현재 상태). 키를 저장하지 않는다.
+        6. 좌석 SOLD(다른 사람) → 409 SEAT_SOLD
+        7. 홀드 없음(AVAILABLE) → 409 NO_HOLD
+        8. 홀드 만료(now >= expiresAt) → 409 HOLD_EXPIRED
+        9. 다른 사용자의 유효한 홀드 → 403 HOLD_NOT_OWNED
+        10. 같은 holdId에 PENDING 예매가 이미 있음 → 409 PAYMENT_IN_PROGRESS
+        11. PENDING 예매 생성 → 202. 이 응답만 (X-User-Id, Idempotency-Key)에 저장된다.
+
+        키 범위는 사용자별이다. 4xx와 200(5번)은 키를 소비하지 않는다.
+        같은 사용자·같은 키·같은 요청이 동시에 와도 예매는 하나만 생기고 모두 같은 202를 받는다.
       parameters:
         - $ref: "#/components/parameters/XUserId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -96,14 +121,24 @@ paths:
             schema:
               $ref: "#/components/schemas/BookingRequest"
       responses:
-        "201":
-          description: 예매 확정. 좌석은 SOLD가 된다.
+        "200":
+          description: 이 사용자의 이미 확정된 예매(CONFIRMED). 새 예매는 만들지 않는다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "202":
+          description: PENDING 예매 생성(또는 같은 키·같은 요청의 최초 응답 재현).
+          headers:
+            Idempotent-Replayed:
+              description: 저장된 최초 응답을 재현한 경우에만 "true".
+              schema: { type: string, enum: ["true"] }
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Booking"
         "400":
-          description: 요청 본문이 잘못됨(seatId 누락 등). code=INVALID_REQUEST
+          description: Idempotency-Key 또는 본문이 잘못됨. code=INVALID_REQUEST
           content:
             application/json:
               schema:
@@ -111,7 +146,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: 다른 사용자가 홀드한 좌석. code=HOLD_NOT_OWNED. 좌석은 그대로 HELD다.
+          description: 다른 사용자의 유효한 홀드. code=HOLD_NOT_OWNED. 아무것도 바뀌지 않는다.
           content:
             application/json:
               schema:
@@ -120,10 +155,87 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            확정할 수 없는 좌석. `code`로 구분한다.
-            - NO_HOLD: 홀드되지 않은 AVAILABLE 좌석
-            - HOLD_EXPIRED: 홀드가 만료됨(좌석은 SOLD가 되지 않고 조회 시 AVAILABLE)
-            - SEAT_SOLD: 이미 판매된(SOLD) 좌석. 예매는 하나만 남는다.
+            결제를 요청할 수 없음. `code`로 구분한다.
+            - IDEMPOTENCY_KEY_MISMATCH: 같은 키로 다른 요청
+            - SEAT_SOLD: 다른 사람에게 판매된(SOLD) 좌석
+            - NO_HOLD: 홀드되지 않은 좌석
+            - HOLD_EXPIRED: 홀드가 만료됨
+            - PAYMENT_IN_PROGRESS: 같은 홀드에 진행 중(PENDING) 결제가 있음
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /bookings/{bookingId}:
+    get:
+      operationId: getBooking
+      summary: 예매 조회 (US-04)
+      description: 예매 주인만 조회할 수 있다. 다른 사용자에게는 404로 응답한다(존재 여부를 숨김).
+      parameters:
+        - $ref: "#/components/parameters/XUserId"
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: 예매의 현재 상태
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /payments/callback:
+    post:
+      operationId: paymentCallback
+      summary: 모의 결제사 결제 결과 콜백 (US-05)
+      description: |
+        모의 결제사가 결제 결과를 알린다. 사용자 헤더는 쓰지 않고 서명으로 검증한다.
+        - 서명: 헤더 X-Mock-Pg-Signature = 요청 본문 원문 바이트의 HMAC-SHA256(키 = 서버 환경변수 MOCK_PG_SECRET,
+          기본값 "mock-pg-dev-secret")을 소문자 16진수로. 없거나 틀리면 401 INVALID_SIGNATURE(본문 해석 전).
+        - 식별: paymentId(POST /bookings가 발급). 모르면 404 NOT_FOUND.
+        - 만료 판단은 서버 get_now()로만 한다. 본문에 다른 필드(시각 등)가 있어도 무시한다.
+
+        현재 예매 상태 × result → 결과 (전이 상세는 docs/backend-interface.md):
+        | 현재 \ result     | SUCCEEDED                                            | FAILED                    |
+        | PENDING           | 홀드 유효 → CONFIRMED + 좌석 SOLD / 아니면 REFUND_REQUIRED (200 applied=true) | FAILED (200 applied=true) |
+        | CONFIRMED         | 변화 없음 (200 applied=false)                        | 409 CALLBACK_CONFLICT     |
+        | FAILED            | REFUND_REQUIRED (200 applied=true)                   | 변화 없음 (200 applied=false) |
+        | REFUND_REQUIRED   | 변화 없음 (200 applied=false)                        | 409 CALLBACK_CONFLICT     |
+        "홀드 유효" = 좌석이 HELD이고, 좌석의 현재 holdId가 예매의 holdId와 같고, now < 그 홀드의 expiresAt.
+        같은 콜백이 동시에 여러 번 와도 applied=true는 정확히 한 번이다.
+      parameters:
+        - $ref: "#/components/parameters/MockPgSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PaymentCallback"
+      responses:
+        "200":
+          description: 처리됨. applied=false면 이미 반영된 같은 결과라 아무것도 바꾸지 않았다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallbackResult"
+        "400":
+          description: 본문이 잘못됨(paymentId 없음, result가 SUCCEEDED/FAILED 아님 등). code=INVALID_REQUEST
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: 서명이 없거나 틀림. code=INVALID_SIGNATURE. 아무것도 바뀌지 않는다.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: 이미 다른 최종 결과가 반영된 예매에 반대 결과가 옴. code=CALLBACK_CONFLICT. 아무것도 바뀌지 않는다.
           content:
             application/json:
               schema:
@@ -139,6 +251,22 @@ components:
       schema:
         type: string
         minLength: 1
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 결제 요청 멱등 키. 1~255자, NUL 금지. 범위는 X-User-Id별. 잘못되면 400(INVALID_REQUEST).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    MockPgSignature:
+      name: X-Mock-Pg-Signature
+      in: header
+      required: true
+      description: 본문 원문의 HMAC-SHA256(MOCK_PG_SECRET) 소문자 16진수.
+      schema:
+        type: string
     ShowId:
       name: showId
       in: path
@@ -147,6 +275,12 @@ components:
         type: string
     SeatId:
       name: seatId
+      in: path
+      required: true
+      schema:
+        type: string
+    BookingId:
+      name: bookingId
       in: path
       required: true
       schema:
@@ -160,7 +294,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: 공연 또는 좌석을 찾을 수 없음. code=NOT_FOUND
+      description: 공연·좌석·예매·결제를 찾을 수 없음. code=NOT_FOUND
       content:
         application/json:
           schema:
@@ -194,14 +328,17 @@ components:
 
     Hold:
       type: object
-      required: [seatId, userId, expiresAt]
+      required: [holdId, seatId, userId, expiresAt]
       properties:
+        holdId:
+          type: string
+          description: 홀드마다 새로 발급. 결제는 이 holdId에 묶인다.
         seatId: { type: string }
         userId: { type: string }
         expiresAt:
           type: string
           format: date-time
-          description: 홀드 시각 + 5분. 이 시각 이후(같은 시각 포함) 만료.
+          description: 홀드 시각(get_now) + 5분. 이 시각 이후(같은 시각 포함) 만료.
 
     BookingRequest:
       type: object
@@ -209,14 +346,50 @@ components:
       properties:
         seatId: { type: string }
 
+    BookingStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, FAILED, REFUND_REQUIRED]
+      description: |
+        PENDING 결제 대기 / CONFIRMED 결제 성공·좌석 SOLD / FAILED 결제 실패(좌석 영향 없음)
+        / REFUND_REQUIRED 돈은 빠져나갔으나 좌석을 팔 수 없음(만료·재홀드 뒤 성공, 실패 뒤 성공). 실제 환불은 하지 않는다.
+
     Booking:
       type: object
-      required: [id, seatId, userId, createdAt]
+      required: [id, seatId, userId, status, paymentId, holdId, holdExpiresAt, createdAt, updatedAt]
       properties:
         id: { type: string }
         seatId: { type: string }
         userId: { type: string }
+        status:
+          $ref: "#/components/schemas/BookingStatus"
+        paymentId:
+          type: string
+          description: 모의 결제사 콜백이 이 값으로 예매를 찾는다.
+        holdId:
+          type: string
+          description: 결제 요청 시점의 홀드. 콜백은 이 홀드가 아직 좌석의 현재 홀드이고 유효할 때만 좌석을 판다.
+        holdExpiresAt: { type: string, format: date-time }
         createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    PaymentCallback:
+      type: object
+      required: [paymentId, result]
+      properties:
+        paymentId: { type: string }
+        result:
+          type: string
+          enum: [SUCCEEDED, FAILED]
+
+    CallbackResult:
+      type: object
+      required: [applied, booking]
+      properties:
+        applied:
+          type: boolean
+          description: 이 콜백으로 예매 상태가 바뀌었으면 true.
+        booking:
+          $ref: "#/components/schemas/Booking"
 
     Error:
       type: object
@@ -233,4 +406,8 @@ components:
             - HOLD_NOT_OWNED
             - NO_HOLD
             - HOLD_EXPIRED
+            - IDEMPOTENCY_KEY_MISMATCH
+            - PAYMENT_IN_PROGRESS
+            - INVALID_SIGNATURE
+            - CALLBACK_CONFLICT
         message: { type: string }
