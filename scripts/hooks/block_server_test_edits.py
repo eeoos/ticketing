@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Claude Code PreToolUse hook: stop the server seat from editing tests/ and e2e/.
+"""Claude Code PreToolUse hook: only the test seat may edit tests/ and e2e/.
+
+Fail-closed: any session whose OPENRIG_SESSION_NAME is not the test seat is blocked,
+including a session whose identity env is missing or wrong (e.g. a Claude Code
+background session that inherited another seat's env). Primary target: server.
 
 This catches the common mistake only. It can be bypassed (e.g. shell redirection
 via Bash), so the final check is `python3 scripts/verify_tests.py check`.
@@ -9,12 +13,13 @@ import os
 import sys
 from pathlib import Path
 
-SERVER_SESSIONS = {"dev-server@tkt"}
+TEST_SESSIONS = {"dev-test@tkt"}
 PROTECTED_DIRS = ("tests", "e2e")
 
 
 def main() -> int:
-    if os.environ.get("OPENRIG_SESSION_NAME") not in SERVER_SESSIONS:
+    session = os.environ.get("OPENRIG_SESSION_NAME") or "(unknown)"
+    if session in TEST_SESSIONS:
         return 0
     try:
         payload = json.load(sys.stdin)
@@ -36,7 +41,7 @@ def main() -> int:
         return 0
     if rel.parts and rel.parts[0] in PROTECTED_DIRS:
         print(
-            f"차단: server 자리는 {rel} 를 수정할 수 없습니다. tests/·e2e/ 는 test 자리 소유입니다. "
+            f"차단: {session} 자리는 {rel} 를 수정할 수 없습니다. tests/·e2e/ 는 test 자리(dev-test@tkt) 소유입니다. "
             "테스트 변경이 필요하면 OpenRig 큐로 lead/test에 요청하세요.",
             file=sys.stderr,
         )

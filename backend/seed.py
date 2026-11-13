@@ -5,7 +5,7 @@ from backend.db import connect
 
 def run(dsn: str | None = None) -> None:
     """예매·좌석·공연을 모두 지우고 공연 1개 + 좌석 100석(AVAILABLE)을 넣는다."""
-    with connect(dsn) as conn:
+    with connect(dsn, application_name="ticketing-tools") as conn:
         conn.execute("TRUNCATE bookings, seats, shows CASCADE")
         show_id = conn.execute(
             "INSERT INTO shows (title, venue, starts_at) VALUES (%s, %s, %s) RETURNING id",

@@ -279,8 +279,12 @@ were handed and what counts as done. If you are setting up a world pack for your
 5. review 검토 뒤 lead가 `python3 scripts/verify_tests.py check`로 확인하고 통합한다.
 
 ## 보호 장치
-- `.claude/settings.json`의 훅(`scripts/hooks/block_server_test_edits.py`)이 server 자리의 `tests/`·`e2e/` Edit·Write를 막는다.
+- `.claude/settings.json`의 훅(`scripts/hooks/block_server_test_edits.py`)이 test 자리(`dev-test@tkt`)가 아닌 모든 자리의 `tests/`·`e2e/` Edit·Write를 막는다(신원이 없거나 틀려도 막는다).
 - 훅은 대표 실수를 막는 장치일 뿐 우회될 수 있다(예: Bash 리다이렉션). **최종 확인은 `scripts/verify_tests.py check`로 한다.**
+
+
+
+
 
 
 

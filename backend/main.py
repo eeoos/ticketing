@@ -5,7 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from backend.db import connect
+from backend.db import app_connection
 
 HOLD_DURATION = timedelta(minutes=5)
 
@@ -52,7 +52,7 @@ def _has_nul(value: str) -> bool:
 
 @app.get("/shows")
 def list_shows():
-    with connect() as conn:
+    with app_connection() as conn:
         rows = conn.execute("SELECT id, title, venue, starts_at FROM shows ORDER BY starts_at, id").fetchall()
     return [{"id": r[0], "title": r[1], "venue": r[2], "startsAt": _iso(r[3])} for r in rows]
 
@@ -61,7 +61,7 @@ def list_shows():
 def seat_map(show_id: str, now: datetime = Depends(get_now)):
     if _has_nul(show_id):
         raise NOT_FOUND
-    with connect() as conn:
+    with app_connection() as conn:
         if not conn.execute("SELECT 1 FROM shows WHERE id = %s", (show_id,)).fetchone():
             raise NOT_FOUND
         rows = conn.execute(
@@ -78,7 +78,7 @@ def hold_seat(seat_id: str, user: str = Depends(require_user), now: datetime = D
     if _has_nul(seat_id):
         raise NOT_FOUND
     expires = now + HOLD_DURATION
-    with connect() as conn:
+    with app_connection() as conn:
         # 조건부 UPDATE: 행 잠금으로 동시 요청이 직렬화되고, 조건을 만족하는 하나만 성공한다.
         row = conn.execute(
             """UPDATE seats SET status = 'HELD', hold_user_id = %s, hold_expires_at = %s
@@ -110,7 +110,7 @@ async def confirm_booking(request: Request, user: str = Depends(require_user), n
 
 
 def _confirm(seat_id: str, user: str, now: datetime):
-    with connect() as conn:
+    with app_connection() as conn:
         seat = conn.execute(
             "SELECT status, hold_user_id, hold_expires_at FROM seats WHERE id = %s FOR UPDATE", (seat_id,)
         ).fetchone()
