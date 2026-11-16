@@ -34,6 +34,8 @@
 - Redis `PX` TTL은 청소용이다(같거나 더 긴 시간). TTL이 남아 있어도 저장된 유효 시각이 지났으면 없는 것으로 본다.
 - **예외: `PENDING` 표시**는 진행 중 요청의 짧은 임대(lease)라 실제 시계 `PX = 2초`로만 사라진다. 가짜 시계를 몇 분 앞당겨도 `PENDING`은 실제 2초 동안 남을 수 있다.
 
+> 9장부터 좌석맵·홀드는 입장권 검증(`docs/queue.md`)을 **먼저** 통과해야 캐시·관문에 닿는다. 입장권 검증은 Redis 장애 때 우회하지 않는다(503).
+
 ## ① 좌석맵 캐시 (캐시 어사이드) — `GET /shows/{showId}/seats`
 - 키 `{p}seatmap:{showId}` = `{validUntilMs, body}`. 응답 헤더 `X-Cache: HIT | MISS | BYPASS`.
 - **읽기**: 항목이 있고 `now < validUntil`이면 HIT(그대로 응답). 아니면 DB에서 계산(MISS) 후 저장. 공연이 없으면(404) 저장하지 않는다.

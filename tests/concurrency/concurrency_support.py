@@ -4,6 +4,7 @@
 겹침 증거(HTTP 최대 동시 진행 수, pg active 최댓값, 서로 다른 application_name 수)를 모은다.
 """
 import asyncio
+import uuid
 import hashlib
 import hmac
 import json
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DSN = "postgresql://ticketing:ticketing@localhost:5432/ticketing_concurrency"
 DEV_DB_NAME = "ticketing"
 WORKERS = 4
+REDIS_DB = 5  # ticket_support.DB_CONCURRENCY
 MOCK_PG_SECRET = os.environ.get("MOCK_PG_SECRET", "mock-pg-dev-secret")  # 테스트와 하위 uvicorn 이 같은 값을 쓴다
 APP_NAME_PREFIX = "ticketing-api-"
 
@@ -73,13 +75,20 @@ class Server:
     """python -m uvicorn backend.main:app --workers 4 --port <빈 포트> 하위 프로세스."""
 
     def __init__(self, dsn: str):
+        from ticket_support import DB_CONCURRENCY, REDIS_HOST_URL, redis_for  # noqa: PLC0415
+        self.prefix = f"conctest-{uuid.uuid4().hex[:8]}:"
+        self.redis_url = f"{REDIS_HOST_URL}/{DB_CONCURRENCY}"
+        self.redis = redis_for(DB_CONCURRENCY)
         self.dsn, self.port = dsn, free_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.log = tempfile.NamedTemporaryFile("w+", prefix="uvicorn-", suffix=".log", delete=False)
         self.proc = None
 
     def start(self, timeout=60):
-        env = dict(os.environ, DATABASE_URL=self.dsn, MOCK_PG_SECRET=MOCK_PG_SECRET)
+        # 9장: 좌석맵·홀드는 입장권(=Redis)이 필요하다. 이 시나리오들의 목적은 DB 의 원자성(동시 홀드 하나만 성공 등)이므로
+        # Redis 홀드 관문은 끈다(HOLD_GATE=off) — 관문이 켜져 있으면 거절이 DB 앞에서 끝나 DB 경쟁을 검증하지 못한다(관문은 tests/cache).
+        env = dict(os.environ, DATABASE_URL=self.dsn, MOCK_PG_SECRET=MOCK_PG_SECRET, REDIS_URL=self.redis_url,
+                   REDIS_KEY_PREFIX=self.prefix, HOLD_GATE="off")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "backend.main:app", "--workers", str(WORKERS),
              "--host", "127.0.0.1", "--port", str(self.port), "--log-level", "warning"],
@@ -99,7 +108,19 @@ class Server:
         self.log.flush()
         return Path(self.log.name).read_text(errors="replace")[-n:]
 
+    def grant_tickets(self, users, show_id):
+        """실제 시계 서버: 사용자마다 입장권을 Redis 에 직접 발급(실제 시각 +2시간). {user: token}.
+        (실제로 얻으려면 구간당 200명 정책이라 500명이면 3초 이상 걸려 시나리오가 느려지고 대기열 동작에 의존한다 — tests/queue 가 따로 검증)"""
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        expires = time.time() * 1000 + 2 * 3_600_000
+        return {u: grant_ticket(self.redis, self.prefix, u, show_id, expires) for u in users}
+
     def stop(self):
+        try:
+            from ticket_support import delete_prefix  # noqa: PLC0415
+            delete_prefix(self.redis, self.prefix)
+        except Exception:  # noqa: BLE001
+            pass
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -296,9 +317,24 @@ def sync_post(server: Server, path: str, user: str | None = None, **kw):
     return httpx.post(server.url + path, headers=headers, timeout=30, **kw)
 
 
+def show_of(server: Server) -> str:
+    return httpx.get(server.url + "/shows", timeout=30).json()[0]["id"]
+
+
+def hold_req(server: Server, seat_id: str, user: str, token: str | None = None) -> dict:
+    """POST /seats/{id}/hold 요청 dict(입장권 포함). token 이 없으면 그 사용자의 입장권을 새로 발급한다."""
+    token = token or server.grant_tickets([user], show_of(server))[user]
+    return dict(method="POST", url=f"/seats/{seat_id}/hold", headers={"X-User-Id": user, "X-Queue-Ticket": token})
+
+
+def sync_hold(server: Server, seat_id: str, user: str):
+    r = hold_req(server, seat_id, user)
+    return httpx.post(server.url + r["url"], headers=r["headers"], timeout=30)
+
+
 def hold_and_pay(server: Server, seat_id: str, user: str, key: str = "setup-key"):
     """(순차) 홀드 → 결제 요청. 202 를 확인하고 (hold, booking) 본문을 돌려준다."""
-    h = sync_post(server, f"/seats/{seat_id}/hold", user)
+    h = sync_hold(server, seat_id, user)
     assert h.status_code == 201, h.text
     b = sync_post(server, "/bookings", user, json={"seatId": seat_id}, headers={"Idempotency-Key": key})
     assert b.status_code == 202, b.text
@@ -317,11 +353,18 @@ def sync_get(server: Server, path: str):
     return r.json()
 
 
+def seats_of(server: Server, show: str) -> list:
+    """좌석맵(보기 전용 사용자 + 입장권)."""
+    viewer = "viewer"
+    token = server.grant_tickets([viewer], show)[viewer]
+    r = httpx.get(f"{server.url}/shows/{show}/seats", headers={"X-User-Id": viewer, "X-Queue-Ticket": token}, timeout=30)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 def first_seat(server: Server) -> str:
-    show = sync_get(server, "/shows")[0]["id"]
-    return sync_get(server, f"/shows/{show}/seats")[0]["id"]
+    return seats_of(server, show_of(server))[0]["id"]
 
 
 def seat_status(server: Server, seat_id: str) -> str:
-    show = sync_get(server, "/shows")[0]["id"]
-    return next(s["status"] for s in sync_get(server, f"/shows/{show}/seats") if s["id"] == seat_id)
+    return next(s["status"] for s in seats_of(server, show_of(server)) if s["id"] == seat_id)

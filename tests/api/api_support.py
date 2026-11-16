@@ -19,6 +19,8 @@ TEST_DSN = os.environ.get("TEST_DATABASE_URL", "postgresql://ticketing:ticketing
 T0 = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 HOLD = timedelta(minutes=5)
 MOCK_PG_SECRET = os.environ.get("MOCK_PG_SECRET", "mock-pg-dev-secret")
+API_REDIS_PREFIX = f"apitest-{uuid.uuid4().hex[:8]}:"  # 이 pytest 프로세스 전용 접두사(끝나면 conftest 가 지운다)
+VIEWER = "viewer"  # 좌석맵을 보기만 하는 시험용 사용자
 NO_KEY = object()  # Idempotency-Key 헤더를 보내지 않는다
 
 
@@ -55,6 +57,10 @@ class Api:
         if self._client is not None:
             return
         try:
+            from ticket_support import DB_API, REDIS_HOST_URL, redis_for  # noqa: PLC0415
+            os.environ["REDIS_URL"] = f"{REDIS_HOST_URL}/{DB_API}"  # 9장부터 좌석맵·홀드는 입장권(=Redis)이 필요하다
+            os.environ["REDIS_KEY_PREFIX"] = API_REDIS_PREFIX
+            self._redis = redis_for(DB_API)
             os.environ["DATABASE_URL"] = TEST_DSN
             _ensure_database()
             from backend import main, migrate, seed  # noqa: PLC0415
@@ -88,6 +94,14 @@ class Api:
         self._ensure()
         return self._make_client()
 
+    # ---- 입장권 (Redis 에 문서화된 형식으로 직접 발급; tests/queue 는 실제 대기열로 얻는다) ----
+    def ticket(self, user, show_id=None, ttl=timedelta(days=1)):
+        """user 의 입장권 token. 만료 = (get_now 기준 지금) + ttl."""
+        self._ensure()
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        sid = show_id or self.show_id()
+        return grant_ticket(self._redis, API_REDIS_PREFIX, user, sid, (self.now + ttl).timestamp() * 1000)
+
     def shows(self, user=None):
         return self.request("GET", "/shows", user=user)
 
@@ -96,8 +110,18 @@ class Api:
         assert r.status_code == 200, r.text
         return r.json()[0]["id"]
 
+    def seats_request(self, show_id=None, user=VIEWER, ticket="auto"):
+        """GET /shows/{id}/seats. ticket: 'auto'(그 사용자·공연의 유효한 입장권) | None(헤더 없음) | token 문자열."""
+        sid = show_id or self.show_id()
+        headers = {}
+        if ticket == "auto" and user:
+            headers["X-Queue-Ticket"] = self.ticket(user, sid)
+        elif ticket not in (None, "auto"):
+            headers["X-Queue-Ticket"] = ticket
+        return self.request("GET", f"/shows/{sid}/seats", user=user, headers=headers)
+
     def seat_map(self, show_id=None):
-        r = self.request("GET", f"/shows/{show_id or self.show_id()}/seats")
+        r = self.seats_request(show_id)
         assert r.status_code == 200, r.text
         return r.json()
 
@@ -107,8 +131,14 @@ class Api:
     def status_of(self, seat_id):
         return next(s["status"] for s in self.seat_map() if s["id"] == seat_id)
 
-    def hold(self, seat_id, user=None, client=None):
-        return self.request("POST", f"/seats/{seat_id}/hold", user=user, client=client)
+    def hold(self, seat_id, user=None, client=None, ticket="auto"):
+        """POST /seats/{id}/hold. ticket: 'auto'(이 사용자의 유효한 입장권) | None(헤더 없음) | token 문자열."""
+        headers = {}
+        if ticket == "auto" and user:
+            headers["X-Queue-Ticket"] = self.ticket(user)
+        elif ticket not in (None, "auto"):
+            headers["X-Queue-Ticket"] = ticket
+        return self.request("POST", f"/seats/{seat_id}/hold", user=user, client=client, headers=headers)
 
     def pay(self, seat_id, user=None, key=None, json=None, headers=None, client=None):
         """POST /bookings. key=None 이면 새 키를 만들고, key=NO_KEY 면 헤더를 보내지 않는다."""

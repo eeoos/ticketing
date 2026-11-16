@@ -217,13 +217,24 @@ class Infra:
     def get(self, path, user="__anonymous__", **kw):
         return self.request("GET", path, user=user, **kw)
 
+    def ticket(self, user, show_id=None):
+        """9장: 좌석맵·홀드는 입장권이 필요하다. Redis(DB 3·이 실행의 접두사)에 문서화된 형식으로 직접 발급(실제 시각 +2시간).
+        대기열 동작 자체는 tests/queue 가 검증한다."""
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        self._ensure()
+        sid = show_id or self.get("/shows").json()[0]["id"]
+        r = redis.Redis.from_url(f"{REDIS_HOST_URL}/{INFRA_REDIS_DB}", decode_responses=True, socket_timeout=3)
+        return grant_ticket(r, self.redis_prefix, user, sid, time.time() * 1000 + 2 * 3_600_000)
+
     def seat_ids(self, n):
         shows = self.get("/shows").json()
-        seats = self.get(f"/shows/{shows[0]['id']}/seats").json()
+        viewer = uid("viewer")
+        seats = self.get(f"/shows/{shows[0]['id']}/seats", user=viewer,
+                         headers={"X-Queue-Ticket": self.ticket(viewer, shows[0]["id"])}).json()
         return [s["id"] for s in seats[:n]]
 
     def hold(self, seat, user):
-        return self.request("POST", f"/seats/{seat}/hold", user=user)
+        return self.request("POST", f"/seats/{seat}/hold", user=user, headers={"X-Queue-Ticket": self.ticket(user)})
 
     def pay(self, seat, user, key):
         return self.request("POST", "/bookings", user=user, json={"seatId": seat}, headers={"Idempotency-Key": key})

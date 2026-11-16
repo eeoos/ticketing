@@ -2,7 +2,9 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -12,7 +14,7 @@ from fastapi.responses import JSONResponse
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from backend import cache
+from backend import cache, waitline
 from backend.db import app_connection
 
 HOLD_DURATION = timedelta(minutes=5)
@@ -96,6 +98,55 @@ def _not_utf8(value: str) -> bool:
     return False
 
 
+QUEUE_UNAVAILABLE = ApiError(503, "QUEUE_UNAVAILABLE", "대기열을 쓸 수 없습니다. 잠시 후 다시 시도하세요.",
+                             {"Retry-After": "5"})
+_TICKET_MESSAGES = {"QUEUE_TICKET_REQUIRED": "입장권이 필요합니다.", "QUEUE_TICKET_INVALID": "입장권이 올바르지 않습니다.",
+                    "QUEUE_TICKET_EXPIRED": "입장권이 만료되었습니다."}
+
+
+def _require_ticket(request: Request, user: str, show_id: str, now: datetime) -> None:
+    """입장권 검증(읽기만). 실패하면 403, Redis 를 쓸 수 없으면 503(우회 없음). 캐시·관문·DB 보다 먼저."""
+    try:
+        code = waitline.check_ticket(request.headers.get("x-queue-ticket"), user, show_id, now)
+    except waitline.QueueUnavailable:
+        raise QUEUE_UNAVAILABLE
+    if code:
+        raise ApiError(403, code, _TICKET_MESSAGES[code])
+
+
+_known_shows: set[str] = set()
+_seat_shows: dict[str, str] = {}  # 좌석 → 공연: 바뀌지 않는 정보라 프로세스 안에 기억해 둔다
+
+
+def _show_exists(show_id: str) -> bool:
+    if show_id in _known_shows:
+        return True
+    with app_connection() as conn:
+        found = conn.execute("SELECT 1 FROM shows WHERE id = %s", (show_id,)).fetchone()
+    if found:
+        _known_shows.add(show_id)
+    return bool(found)
+
+
+_SEAT_LOOKUP_LOCKS = [threading.Lock() for _ in range(64)]  # 고정 개수 줄무늬 잠금: 없는 좌석 id 로 메모리가 늘지 않는다
+
+
+def _show_of_seat(seat_id: str) -> str | None:
+    """좌석 → 공연. 바뀌지 않는 정보라 프로세스 안에 기억하고, 같은 좌석을 동시에 처음 찾는 요청은 하나만 DB 에 간다
+    (좌석 id 해시로 고른 줄무늬 잠금 + 잠금 안 재확인). 없는 좌석(None)은 기억하지 않는다."""
+    show = _seat_shows.get(seat_id)
+    if show is not None:
+        return show
+    with _SEAT_LOOKUP_LOCKS[zlib.crc32(seat_id.encode("utf-8", "surrogatepass")) % len(_SEAT_LOOKUP_LOCKS)]:
+        show = _seat_shows.get(seat_id)
+        if show is None:
+            with app_connection() as conn:
+                row = conn.execute("SELECT show_id FROM seats WHERE id = %s", (seat_id,)).fetchone()
+            if row:
+                show = _seat_shows[seat_id] = row[0]
+    return show
+
+
 @app.get("/shows")
 def list_shows():
     with app_connection() as conn:
@@ -104,7 +155,8 @@ def list_shows():
 
 
 @app.get("/shows/{show_id}/seats")
-def seat_map(show_id: str, now: datetime = Depends(get_now)):
+def seat_map(show_id: str, request: Request, user: str = Depends(require_user), now: datetime = Depends(get_now)):
+    _require_ticket(request, user, show_id, now)  # 401 → 입장권 → 캐시 → DB
     if _has_nul(show_id):
         raise NOT_FOUND
     state, body, ver = cache.seatmap_read(show_id, now)  # 버전은 DB 를 읽기 전에 읽어 둔다
@@ -134,9 +186,13 @@ def seat_map(show_id: str, now: datetime = Depends(get_now)):
 
 
 @app.post("/seats/{seat_id}/hold", status_code=201)
-def hold_seat(seat_id: str, user: str = Depends(require_user), now: datetime = Depends(get_now)):
-    if _has_nul(seat_id):
+def hold_seat(seat_id: str, request: Request, user: str = Depends(require_user), now: datetime = Depends(get_now)):
+    if _has_nul(seat_id):  # 401 → 입력 검증 → 좌석의 공연(없으면 404) → 입장권 → 관문 → DB
         raise NOT_FOUND
+    show_of_seat = _show_of_seat(seat_id)
+    if show_of_seat is None:
+        raise NOT_FOUND
+    _require_ticket(request, user, show_of_seat, now)
     token = uuid.uuid4().hex
     outcome, code = cache.gate(seat_id, user, token, now)  # 입력 검증 뒤, DB 에 가기 전
     gate_headers = {"X-Hold-Gate": outcome}
@@ -351,3 +407,39 @@ def _apply_callback(payment_id: str, result: str, now: datetime):
         cache.mark_sold(b[1], b[2])
         cache.seatmap_invalidate(seat[3])
     return {"applied": True, "booking": _booking_body(updated)}
+
+
+# ---------------------------------------------------------------------------------------------
+# 9장: 가상 대기열. 번호표·내 순서는 Redis 가 없으면 503(우회 없음).
+# ---------------------------------------------------------------------------------------------
+def _queue_body(show_id: str, st: dict) -> dict:
+    ticket = None
+    if st["token"]:
+        ticket = {"token": st["token"], "expiresAt": waitline.iso_from_ms(st["expMs"])}
+    return {"showId": show_id, "number": st["number"], "serving": st["serving"], "ahead": st["ahead"],
+            "status": st["status"], "retryAfterSeconds": st["retryAfterSeconds"], "ticket": ticket}
+
+
+@app.post("/shows/{show_id}/queue")
+def join_queue(show_id: str, user: str = Depends(require_user), now: datetime = Depends(get_now)):
+    if _has_nul(show_id) or not _show_exists(show_id):
+        raise NOT_FOUND
+    try:
+        created, st = waitline.join(show_id, user, now)
+    except waitline.QueueUnavailable:
+        raise QUEUE_UNAVAILABLE
+    return JSONResponse(_queue_body(show_id, st), status_code=201 if created else 200)
+
+
+@app.get("/shows/{show_id}/queue/me")
+def my_queue_status(show_id: str, user: str = Depends(require_user), now: datetime = Depends(get_now)):
+    if _has_nul(show_id):
+        raise ApiError(404, "QUEUE_ENTRY_NOT_FOUND", "줄을 선 적이 없습니다.")
+    try:
+        st = waitline.me(show_id, user, now)
+    except waitline.QueueUnavailable:
+        raise QUEUE_UNAVAILABLE
+    if st is None:
+        raise ApiError(404, "QUEUE_ENTRY_NOT_FOUND", "줄을 선 적이 없습니다.")
+    headers = {"Retry-After": str(st["retryAfterSeconds"])} if st["status"] == "WAITING" else None
+    return JSONResponse(_queue_body(show_id, st), headers=headers)

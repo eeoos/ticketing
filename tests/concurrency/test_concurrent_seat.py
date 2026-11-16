@@ -3,7 +3,7 @@ import psycopg
 import pytest
 
 from concurrency_support import (APP_NAME_PREFIX, bookings_of, callback_request, first_seat, hold_and_pay,
-                                 run_concurrently, seat_status, sync_get)
+                                 hold_req, run_concurrently, seat_status, show_of, sync_get)
 
 HOLDERS = 500
 CONFIRMS = 20
@@ -23,8 +23,9 @@ def check_overlap(run, report, name):
 
 def test_c01_500_users_hold_same_seat_exactly_one_wins(server, dsn, report):
     seat = first_seat(server)
-    reqs = [dict(method="POST", url=f"/seats/{seat}/hold", headers={"X-User-Id": f"user-{i}"})
-            for i in range(HOLDERS)]
+    users = [f"user-{i}" for i in range(HOLDERS)]
+    tickets = server.grant_tickets(users, show_of(server))  # 실제 시계 서버: 입장권은 Redis 에 직접 발급
+    reqs = [hold_req(server, seat, u, tickets[u]) for u in users]
     run = run_concurrently(server, dsn, reqs)
     check_overlap(run, report, "C-01")
     ev = run.evidence()
@@ -52,8 +53,8 @@ def pay_req(seat, user, key):
 
 
 def first_two_seats(server):
-    show = sync_get(server, "/shows")[0]["id"]
-    seats = sync_get(server, f"/shows/{show}/seats")
+    from concurrency_support import seats_of
+    seats = seats_of(server, show_of(server))
     return seats[0]["id"], seats[1]["id"]
 
 
@@ -65,8 +66,7 @@ def db_hold(dsn, seat):
 def test_c02_same_user_20_concurrent_payment_flows_end_with_one_confirmed_booking(server, dsn, report):
     """홀드한 본인이 새 키로 '결제 요청 → (202 이면) 성공 콜백' 흐름을 20개 동시에 한다. 좌석당 확정 예매는 하나."""
     seat = first_seat(server)
-    assert run_concurrently(server, dsn, [dict(method="POST", url=f"/seats/{seat}/hold",
-                                               headers={"X-User-Id": "A"})]).results[0].status == 201
+    assert run_concurrently(server, dsn, [hold_req(server, seat, "A")]).results[0].status == 201
 
     def flow(i):
         async def run(call):
@@ -93,8 +93,7 @@ def test_c02_same_user_20_concurrent_payment_flows_end_with_one_confirmed_bookin
 
 def test_c03_same_user_same_key_20_concurrent_requests_create_one_booking(server, dsn, report):
     seat = first_seat(server)
-    assert run_concurrently(server, dsn, [dict(method="POST", url=f"/seats/{seat}/hold",
-                                               headers={"X-User-Id": "A"})]).results[0].status == 201
+    assert run_concurrently(server, dsn, [hold_req(server, seat, "A")]).results[0].status == 201
     run = run_concurrently(server, dsn, [pay_req(seat, "A", "same-key") for _ in range(CONFIRMS)])
     check_overlap(run, report, "C-03")
     ev = run.evidence()
@@ -109,8 +108,7 @@ def test_c03_same_user_same_key_20_concurrent_requests_create_one_booking(server
 
 def test_c04_same_hold_20_different_keys_one_pending(server, dsn, report):
     seat = first_seat(server)
-    assert run_concurrently(server, dsn, [dict(method="POST", url=f"/seats/{seat}/hold",
-                                               headers={"X-User-Id": "A"})]).results[0].status == 201
+    assert run_concurrently(server, dsn, [hold_req(server, seat, "A")]).results[0].status == 201
     run = run_concurrently(server, dsn, [pay_req(seat, "A", f"key-{i}") for i in range(CONFIRMS)])
     check_overlap(run, report, "C-04")
     ev = run.evidence()
@@ -171,8 +169,7 @@ def test_c07_same_user_same_key_different_seats_concurrently_one_booking_other_s
     좌석 행 잠금이 직렬화해 주지 않으므로 (user_id, idempotency_key) UNIQUE 충돌 재시도 분기를 탄다."""
     seat1, seat2 = first_two_seats(server)
     for seat in (seat1, seat2):
-        assert run_concurrently(server, dsn, [dict(method="POST", url=f"/seats/{seat}/hold",
-                                                   headers={"X-User-Id": "A"})]).results[0].status == 201
+        assert run_concurrently(server, dsn, [hold_req(server, seat, "A")]).results[0].status == 201
     reqs = []
     for _ in range(CONFIRMS // 2):  # S1, S2 번갈아
         reqs += [pay_req(seat1, "A", "k"), pay_req(seat2, "A", "k")]

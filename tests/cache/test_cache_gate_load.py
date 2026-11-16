@@ -14,7 +14,10 @@ xact_commit + xact_rollback 증가분.
 import time
 from collections import Counter
 
-from cache_support import Server, delete_prefix, fire, new_prefix, reset_database, uid, xact_total
+import time as _time
+
+from cache_support import (Server, TEST_REDIS_DB, delete_prefix, fire, new_prefix, redis_client, reset_database, uid,
+                           xact_total)
 
 N = 200
 
@@ -28,10 +31,17 @@ def run_scenario(gate):
     before = xact_total()
     srv = Server(prefix, gate).start()
     try:
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        r = redis_client(TEST_REDIS_DB)
+        expires = _time.time() * 1000 + 2 * 3_600_000  # 실제 시계 서버: 입장권은 실제 시각 기준으로 2시간 유효하게 직접 발급
         show = srv.client.get("/shows").json()[0]["id"]
-        seat = srv.client.get(f"/shows/{show}/seats").json()[0]["id"]
-        responses = fire(srv, [dict(method="POST", url=f"/seats/{seat}/hold", headers={"X-User-Id": uid("u")})
-                               for _ in range(N)])
+        viewer = uid("viewer")
+        seat = srv.client.get(f"/shows/{show}/seats", headers={
+            "X-User-Id": viewer, "X-Queue-Ticket": grant_ticket(r, prefix, viewer, show, expires)}).json()[0]["id"]
+        users = [uid("u") for _ in range(N)]
+        tickets = [grant_ticket(r, prefix, u, show, expires) for u in users]
+        responses = fire(srv, [dict(method="POST", url=f"/seats/{seat}/hold",
+                                    headers={"X-User-Id": u, "X-Queue-Ticket": t}) for u, t in zip(users, tickets)])
     finally:
         srv.stop()  # 워커 종료 → DB 연결 닫힘 → 통계 반영
         delete_prefix(prefix)

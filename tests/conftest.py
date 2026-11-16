@@ -14,6 +14,9 @@ import fcntl
 import os
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_support"))  # 공용 시험 도구(ticket_support)
 
 LOCK_PATH = os.environ.get("TICKETING_TESTS_LOCK", "/tmp/ticketing-tests.lock")
 HELD_ENV = "TICKETING_TESTS_LOCK_HELD"

@@ -29,10 +29,12 @@ ROOT = Path(__file__).resolve().parents[2]
 CACHE_DSN = os.environ.get("CACHE_DATABASE_URL", "postgresql://ticketing:ticketing@localhost:5432/ticketing_cache")
 REDIS_HOST_URL = "redis://localhost:6379"
 TEST_REDIS_DB = 1  # 개발 스택은 DB 0
-STACK_REDIS_DB = 2  # 3대 스택 테스트용
+STACK_REDIS_DB = 2  # 3대 스택 테스트용(cache). 대기열 3대 스택은 DB 6
+STACK_BASE_URL = "http://localhost:8080"
 DEV_DB_NAME = "ticketing"
 MOCK_PG_SECRET = os.environ.get("MOCK_PG_SECRET", "mock-pg-dev-secret")
 T0 = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+VIEWER_USER = "viewer"  # 좌석맵을 보기만 하는 시험용 사용자
 APPS = ("app1", "app2", "app3")
 
 
@@ -202,6 +204,22 @@ class ClockServer(_Proc):
         if self.owns_clock:
             self.clock_file.unlink(missing_ok=True)
 
+    # ---- 입장권 (docs/queue.md): 이 서버의 Redis·접두사에 문서화된 형식으로 직접 발급. 만료는 get_now 기준 +1일 ----
+    def grant_ticket(self, user, show_id=None, ttl=timedelta(days=1)):
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        r = redis_client(TEST_REDIS_DB)
+        return grant_ticket(r, self.prefix, user, show_id or self.show_id(), ms(T0 + ttl))
+
+    def _ticket_headers(self, user, show_id, ticket):
+        headers = {}
+        if user:
+            headers["X-User-Id"] = user
+        if ticket == "auto" and user:
+            headers["X-Queue-Ticket"] = self.grant_ticket(user, show_id)
+        elif ticket not in (None, "auto"):
+            headers["X-Queue-Ticket"] = ticket
+        return headers
+
     # ---- API 도우미 ----
     def show_id(self):
         return self.client.get("/shows").json()[0]["id"]
@@ -215,15 +233,17 @@ class ClockServer(_Proc):
         ids = [r[0] for r in rows]
         return ids if n is None else ids[:n]
 
-    def seatmap(self, show_id=None):
-        return self.client.get(f"/shows/{show_id or self.show_id()}/seats")
+    def seatmap(self, show_id=None, user=VIEWER_USER, ticket="auto"):
+        """GET /shows/{id}/seats. 기본: 보기 전용 사용자 + 그 공연의 유효한 입장권(9장). ticket=None 이면 헤더 없음."""
+        sid = show_id or self.show_id()
+        return self.client.get(f"/shows/{sid}/seats", headers=self._ticket_headers(user, sid, ticket))
 
     @staticmethod
     def statuses(resp):
         return {s["id"]: s["status"] for s in resp.json()}
 
-    def hold(self, seat, user):
-        return self.client.post(f"/seats/{seat}/hold", headers={"X-User-Id": user})
+    def hold(self, seat, user, ticket="auto"):
+        return self.client.post(f"/seats/{seat}/hold", headers=self._ticket_headers(user, None, ticket))
 
     def pay(self, seat, user, key=None):
         return self.client.post("/bookings", json={"seatId": seat},
@@ -327,3 +347,87 @@ class RedisStopped:
             raise RuntimeError(f"redis 복구 실패: docker compose start redis ({(p.stderr or p.stdout).strip()[-300:]})")
         wait_redis_healthy()
         self.stopped = False
+
+
+class Stack:
+    """앱 3대 + Nginx 를 테스트용 DB·Redis DB·접두사로 다시 띄우고 끝나면 기본값으로 되돌린다(복구 실패는 예외)."""
+
+    def __init__(self, redis_db=STACK_REDIS_DB):
+        self.prefix = new_prefix()
+        self.redis_db = redis_db
+        self.touched = False
+        self.error = None
+        self.client = None
+
+    def ensure(self):
+        if self.error:
+            raise AssertionError(self.error)
+        if self.client:
+            return
+        try:
+            reset_database()
+            self.touched = True
+            compose("up", "-d", "--build", "--wait", *APPS, "nginx",
+                    env_extra={"APP_DB_NAME": db_name(), "APP_REDIS_DB": str(self.redis_db),
+                               "APP_REDIS_KEY_PREFIX": self.prefix})
+            self.client = httpx.Client(base_url=STACK_BASE_URL, timeout=30)
+            self._wait_apps()
+        except Exception as e:  # noqa: BLE001
+            self.error = f"3대 스택을 준비하지 못했다: {type(e).__name__}: {str(e)[-1200:]}"
+            raise AssertionError(self.error) from e
+
+    def _wait_apps(self, timeout=60):
+        seen, deadline = set(), time.monotonic() + timeout
+        while time.monotonic() < deadline and seen != set(APPS):
+            try:
+                r = self.client.get("/shows")
+                if r.status_code == 200 and r.headers.get("X-App-Id"):
+                    seen.add(r.headers["X-App-Id"])
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.2)
+        if seen != set(APPS):
+            raise RuntimeError(f"세 앱이 모두 응답하지 않았다: {sorted(seen)}")
+
+    def grant_ticket(self, user, show_id, ttl_ms=2 * 3_600_000):
+        """실제 시계 기준 ttl 로 입장권을 직접 발급(앱 3대가 같은 Redis 에서 검증)."""
+        from ticket_support import grant_ticket  # noqa: PLC0415
+        return grant_ticket(redis_client(self.redis_db), self.prefix, user, show_id, time.time() * 1000 + ttl_ms)
+
+    def show_id(self):
+        return self.client.get("/shows").json()[0]["id"]
+
+    def verify_default(self):
+        problems = []
+        for app in APPS:
+            for var, expect in (("DATABASE_URL", "/ticketing"), ("REDIS_URL", "/0"), ("REDIS_KEY_PREFIX", "tkt:")):
+                p = compose("exec", "-T", app, "printenv", var, check=False)
+                val = p.stdout.strip()
+                ok = val.endswith(expect) if var != "REDIS_KEY_PREFIX" else val == expect
+                if p.returncode or not ok:
+                    problems.append(f"{app}: {var}={val!r} (기본값 {expect} 아님)")
+        ps = compose("ps", "--format", "json", check=False)
+        states = {}
+        for line in ps.stdout.splitlines():
+            if line.strip().startswith("{"):
+                row = json.loads(line)
+                states[row.get("Service")] = row
+        for svc in (*APPS, "nginx", "redis", "db"):
+            row = states.get(svc)
+            if not row or row.get("State") != "running" or row.get("Health") not in ("healthy", ""):
+                problems.append(f"{svc}: {None if not row else (row.get('State'), row.get('Health'))} (running/healthy 아님)")
+        return problems
+
+    def finalize(self):
+        if self.client:
+            self.client.close()
+        if not self.touched:
+            return
+        delete_prefix(self.prefix, self.redis_db)
+        errors = []
+        p = compose("up", "-d", "--wait", *APPS, "nginx", drop_env=("APP_DB_NAME", "APP_REDIS_DB", "APP_REDIS_KEY_PREFIX"), check=False)
+        if p.returncode:
+            errors.append(f"기본 설정 복구(up) 실패: {(p.stdout + p.stderr).strip()[-300:]}")
+        errors.extend(self.verify_default())
+        if errors:
+            raise RuntimeError("복구되지 않은 항목: " + " | ".join(errors))

@@ -88,12 +88,16 @@ def test_cache_gate_db_decides_when_the_redis_mark_is_lost(server, r):
 
 
 # ---- DB 실패 시 내 표시만 되돌림 ----
-def test_cache_gate_db_failure_releases_my_mark(server, r):
+def test_cache_gate_unknown_seat_is_404_before_the_gate_so_no_header_and_no_mark(server, r):
+    """9장 검사 순서(docs/queue.md): 401 → 입력 검증 → 좌석의 공연 찾기(없는 좌석 404) → 입장권 → 관문 → DB.
+    없는 좌석은 관문에 닿지 않는다: 404 NOT_FOUND·X-Hold-Gate 헤더 없음·그 좌석의 관문 표시 키가 생기지 않는다(두 번 불러도 같다).
+    ('DB 가 실패한 뒤 내 표시만 되돌림'은 아래 test_cache_gate_db_conflict_after_pass_releases_pending_mark 가 계속 검증한다.)"""
+    key = marker_key(server, "no-such-seat")
     for _ in range(2):  # 표시가 남았다면 두 번째 요청이 409 SEAT_HELD 를 받는다
         resp = server.hold("no-such-seat", uid("A"))
         err(resp, 404, "NOT_FOUND")
-        assert gate(resp) == "PASS", "관문은 통과(표시 후 DB 에서 404)"
-    assert r.exists(marker_key(server, "no-such-seat")) == 0, "DB 실패 뒤 내 PENDING 표시는 지워진다"
+        assert gate(resp) is None, f"없는 좌석은 관문에 닿지 않으므로 X-Hold-Gate 헤더가 없어야 한다: {gate(resp)}"
+        assert r.exists(key) == 0, "없는 좌석에 관문 표시 키가 생겼다"
 
 
 def test_cache_gate_db_conflict_after_pass_releases_pending_mark(server, r):
@@ -109,21 +113,13 @@ def test_cache_gate_db_conflict_after_pass_releases_pending_mark(server, r):
     assert gate(again) == "PASS", "표시가 남아 있지 않으니 다시 DB 까지 간다"
 
 
-# ---- Redis 오류는 5xx 로 새지 않는다 ----
-def test_cache_unreachable_redis_requests_bypass_without_5xx(make_server):
+# ---- Redis 를 쓸 수 없을 때 (9장 정책): 좌석맵·홀드는 503, DB 만 쓰는 엔드포인트는 계속 ----
+def test_cache_unreachable_redis_seatmap_and_hold_are_503_and_db_endpoints_keep_working(make_server):
     srv = make_server(redis_url="redis://127.0.0.1:1/0", timeout_ms=200)  # 아무도 듣지 않는 포트
     show, seat, user = srv.show_id(), srv.seat_ids(1)[0], uid("A")
-    for _ in range(2):
-        resp = srv.seatmap(show)
-        assert resp.status_code == 200 and resp.headers.get("X-Cache") == "BYPASS", (resp.status_code, resp.headers.get("X-Cache"))
-    ok = srv.hold(seat, user)
-    assert ok.status_code == 201, ok.text
-    assert gate(ok) == "BYPASS"
-    dup = srv.hold(seat, uid("B"))
-    err(dup, 409, "SEAT_HELD")
-    assert gate(dup) == "BYPASS", "관문 없이 DB 가 판단"
-    pay = srv.pay(seat, user)
-    assert pay.status_code == 202, pay.text
-    cb = srv.callback(pay.json()["paymentId"], "SUCCEEDED")
-    assert cb.status_code == 200 and cb.json()["booking"]["status"] == "CONFIRMED", cb.text
-    assert srv.statuses(srv.seatmap(show))[seat] == "SOLD"
+    for resp in (srv.seatmap(show, user=user, ticket="any-token"), srv.hold(seat, user, ticket="any-token")):
+        err(resp, 503, "QUEUE_UNAVAILABLE")
+        assert resp.headers.get("Retry-After") == "5"
+    assert srv.client.get("/shows").status_code == 200
+    err(srv.pay(seat, user), 409, "NO_HOLD")  # 결제 요청은 DB 만으로 판단
+    err(srv.callback("no-such-payment", "SUCCEEDED"), 404, "NOT_FOUND")

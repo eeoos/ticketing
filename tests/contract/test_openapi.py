@@ -375,12 +375,16 @@ def test_us05_ac2_ac6_callback_description_states_state_table_and_server_clock()
 
 
 # ---------- 공통: 오류 code enum ----------
-def test_us04_ac12_error_code_enum_has_all_new_codes():
+ALL_ERROR_CODES = {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD", "HOLD_NOT_OWNED",
+                   "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH", "PAYMENT_IN_PROGRESS",
+                   "INVALID_SIGNATURE", "CALLBACK_CONFLICT", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE",
+                   "QUEUE_TICKET_REQUIRED", "QUEUE_TICKET_INVALID", "QUEUE_TICKET_EXPIRED", "QUEUE_ENTRY_NOT_FOUND",
+                   "QUEUE_UNAVAILABLE"}  # v0.5.0: 새 code 5개 추가(총 19)
+
+
+def test_us04_ac12_error_code_enum_has_all_codes_including_the_queue_ones():
     spec = load_spec()
-    expected = {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD", "HOLD_NOT_OWNED",
-                "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH", "PAYMENT_IN_PROGRESS",
-                "INVALID_SIGNATURE", "CALLBACK_CONFLICT", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"}
-    assert error_enum(spec) == expected, sorted(error_enum(spec) ^ expected)
+    assert error_enum(spec) == ALL_ERROR_CODES, sorted(error_enum(spec) ^ ALL_ERROR_CODES)
 
 
 def test_us04_ac1_old_confirm_flow_is_gone_bookings_201_not_defined():
@@ -391,7 +395,8 @@ def test_us04_ac1_old_confirm_flow_is_gone_bookings_201_not_defined():
 
 # ---------- 7장 계약(v0.3.0): 게이트웨이 응답 429 · 502 ----------
 RATE_LIMITED_PATHS = [("/shows", "get"), ("/shows/{showId}/seats", "get"), ("/seats/{seatId}/hold", "post"),
-                      ("/bookings", "post"), ("/bookings/{bookingId}", "get")]  # X-User-Id 를 받을 수 있는 경로
+                      ("/bookings", "post"), ("/bookings/{bookingId}", "get"),
+                      ("/shows/{showId}/queue", "post"), ("/shows/{showId}/queue/me", "get")]  # X-User-Id 를 받을 수 있는 경로
 ALL_PATHS = RATE_LIMITED_PATHS + [("/payments/callback", "post")]
 
 
@@ -400,9 +405,9 @@ def raw_response_ref(spec, path, method, code):
     return (op.get("responses") or {}).get(code)
 
 
-def test_contract_version_is_0_4_0_and_mentions_gateway_app_id_header():
+def test_contract_version_is_0_5_0_and_mentions_gateway_app_id_header():
     spec = load_spec()
-    assert spec["info"]["version"] == "0.4.0", spec["info"]["version"]
+    assert spec["info"]["version"] == "0.5.0", spec["info"]["version"]
     assert "X-App-Id" in spec["info"].get("description", ""), "info 설명에 X-App-Id 가 없다"
 
 
@@ -489,10 +494,7 @@ def test_contract_hold_description_states_x_hold_gate_values_409_kept_and_gate_c
     assert "401(X-User-Id 없음)은 관문 전에 끝나므로 이 헤더가 없다" in text, "401 에는 헤더가 없다는 문구가 없다"
     assert "오류 code 계약은 같다" not in text, "옛 문구('오류 code 계약은 같다')가 남아 있다"
     assert {"201", "401", "404", "409"} <= set(op["responses"]), sorted(op["responses"])
-    assert error_enum(spec) == {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD",
-                                "HOLD_NOT_OWNED", "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH",
-                                "PAYMENT_IN_PROGRESS", "INVALID_SIGNATURE", "CALLBACK_CONFLICT", "RATE_LIMITED",
-                                "UPSTREAM_UNAVAILABLE"}, "8장에서 오류 code 집합은 바뀌지 않는다"
+    assert error_enum(spec) == ALL_ERROR_CODES
 
 
 def test_contract_only_seatmap_defines_x_cache_header():
@@ -505,3 +507,112 @@ def test_contract_only_seatmap_defines_x_cache_header():
                 headers = (resolve(spec, resp) or {}).get("headers") or {}
                 if "X-Cache" in headers:
                     assert (path, method, code) == ("/shows/{showId}/seats", "get", "200"), (path, method, code)
+
+
+# ---------- 9장 계약(v0.5.0): 가상 대기열 · 입장권 ----------
+def test_contract_info_describes_the_virtual_queue_and_ticket_header():
+    spec = load_spec()
+    text = " ".join(spec["info"].get("description", "").split())
+    for word in ("가상 대기열", "docs/queue.md", "1초마다 200명씩", "2분짜리 입장권", "X-Queue-Ticket", "503 QUEUE_UNAVAILABLE"):
+        assert word in text, f"info 설명에 '{word}' 가 없다"
+
+
+def test_contract_join_queue_post_defines_201_200_and_errors_with_queue_status_body():
+    spec = load_spec()
+    item, op = path_op(spec, "/shows/{showId}/queue", "post")
+    assert op["operationId"] == "joinQueue"
+    assert header_param(spec, item, op, "X-User-Id")["required"] is True
+    r = responses(spec, op)
+    assert {"200", "201", "401", "404", "429", "502", "503"} <= set(r), sorted(r)
+    for code in ("200", "201"):
+        assert schema_of(spec, r[code]) == schema_named(spec, "QueueStatus"), code
+    assert "201" in r and "200" in r
+    text = " ".join(op.get("description", "").split())
+    for word in ("같은 사용자는 다시 불러도", "200", "만료된 뒤 부르면 맨 뒤 새 번호(201)", "전광판 올리기"):
+        assert word in text, f"번호표 설명에 '{word}' 가 없다"
+    assert raw_response_ref(spec, "/shows/{showId}/queue", "post", "503") == {"$ref": "#/components/responses/QueueUnavailable"}
+
+
+def test_contract_queue_me_get_defines_retry_after_header_and_entry_not_found():
+    spec = load_spec()
+    item, op = path_op(spec, "/shows/{showId}/queue/me", "get")
+    assert op["operationId"] == "getMyQueueStatus"
+    assert header_param(spec, item, op, "X-User-Id")["required"] is True
+    r = responses(spec, op)
+    assert {"200", "401", "404", "429", "502", "503"} <= set(r), sorted(r)
+    retry = r["200"]["headers"]["Retry-After"]["schema"]
+    assert retry["type"] == "integer" and retry["minimum"] == 1 and retry["maximum"] == 5, retry
+    assert schema_of(spec, r["200"]) == schema_named(spec, "QueueStatus")
+    assert "QUEUE_ENTRY_NOT_FOUND" in str(r["404"]), "줄 선 적 없음 404 의 code 가 QUEUE_ENTRY_NOT_FOUND 여야 한다"
+
+
+def test_contract_queue_status_schema_fields_status_enum_and_nullable_ticket():
+    spec = load_spec()
+    status = schema_named(spec, "QueueStatus")
+    required = {"showId", "number", "serving", "ahead", "status", "retryAfterSeconds", "ticket"}
+    assert required <= set(status["required"]) and required <= set(status["properties"])
+    assert status["properties"]["status"]["enum"] == ["WAITING", "ADMITTED", "EXPIRED"]
+    assert status["properties"]["number"]["minimum"] == 1 and status["properties"]["serving"]["minimum"] == 0
+    assert status["properties"]["ahead"]["minimum"] == 0
+    ticket_one_of = status["properties"]["ticket"]["oneOf"]
+    assert {"$ref": "#/components/schemas/QueueTicket"} in ticket_one_of and {"type": "null"} in ticket_one_of, ticket_one_of
+    ticket = schema_named(spec, "QueueTicket")
+    assert set(ticket["required"]) == {"token", "expiresAt"}
+    assert ticket["properties"]["expiresAt"]["format"] == "date-time"
+
+
+@pytest.mark.parametrize("path,method", [("/shows/{showId}/seats", "get"), ("/seats/{seatId}/hold", "post")],
+                         ids=["seatmap", "hold"])
+def test_contract_ticket_header_required_and_403_503_defined_where_a_ticket_is_needed(path, method):
+    spec = load_spec()
+    item, op = path_op(spec, path, method)
+    ticket = header_param(spec, item, op, "X-Queue-Ticket")
+    assert ticket and ticket["required"] is True, f"{path} 에 required X-Queue-Ticket 헤더가 없다"
+    assert header_param(spec, item, op, "X-User-Id")["required"] is True, f"{path} 는 X-User-Id 도 필요하다"
+    assert raw_response_ref(spec, path, method, "403") == {"$ref": "#/components/responses/QueueTicketRejected"}
+    assert raw_response_ref(spec, path, method, "503") == {"$ref": "#/components/responses/QueueUnavailable"}
+    assert "401" in responses(spec, op)
+
+
+def test_contract_seatmap_description_states_ticket_check_before_cache_and_403_for_unknown_show():
+    spec = load_spec()
+    text = " ".join(spec["paths"]["/shows/{showId}/seats"]["get"]["description"].split())
+    for word in ("X-User-Id와 이 공연의 유효한 입장권(X-Queue-Ticket)이 필요하다", "입장권 검증은 좌석 캐시보다 먼저 한다",
+                 "없는 공연 조회는 403으로 끝난다"):
+        assert word in text, f"좌석맵 설명에 '{word}' 가 없다"
+    assert "X-User-Id는 필요 없다" not in text, "옛 문구('X-User-Id는 필요 없다')가 남아 있다"
+
+
+def test_contract_hold_description_states_the_9th_chapter_check_order():
+    spec = load_spec()
+    text = " ".join(spec["paths"]["/seats/{seatId}/hold"]["post"]["description"].split())
+    for word in ("순서: 401 → 입력 검증 → 좌석의 공연 찾기(없는 좌석 404)", "입장권 검증(403/503) → Redis 홀드 관문 → DB",
+                 "입장권 거절은 관문 표시와 DB를 바꾸지 않는다"):
+        assert word in text, f"홀드 설명에 '{word}' 가 없다"
+
+
+def test_contract_queue_ticket_parameter_and_rejection_responses():
+    spec = load_spec()
+    param = spec["components"]["parameters"]["QueueTicket"]
+    assert param["name"] == "X-Queue-Ticket" and param["in"] == "header" and param["required"] is True
+    for code in ("QUEUE_TICKET_REQUIRED", "QUEUE_TICKET_INVALID", "QUEUE_TICKET_EXPIRED"):
+        assert code in param["description"], f"입장권 헤더 설명에 {code} 가 없다"
+    rejected = " ".join(spec["components"]["responses"]["QueueTicketRejected"]["description"].split())
+    for word in ("QUEUE_TICKET_REQUIRED(헤더 없음)", "QUEUE_TICKET_INVALID(모르는 token·다른 사용자·다른 공연)",
+                 "QUEUE_TICKET_EXPIRED(now ≥ expiresAt)", "좌석 캐시·홀드 관문·DB 모두 건드리지 않는다"):
+        assert word in rejected, f"QueueTicketRejected 설명에 '{word}' 가 없다"
+    unavailable = spec["components"]["responses"]["QueueUnavailable"]
+    assert unavailable["headers"]["Retry-After"]["schema"] == {"type": "integer", "minimum": 1}
+    assert "QUEUE_UNAVAILABLE" in unavailable["description"] and "우회 없음" in unavailable["description"]
+
+
+def test_contract_only_ticketed_and_queue_paths_define_403_queue_rejection_and_queue_503():
+    spec = load_spec()
+    with_403 = {(p, m) for p, item in spec["paths"].items() for m, op in item.items()
+                if m in ("get", "post") and "403" in (op.get("responses") or {})
+                and (op["responses"]["403"] == {"$ref": "#/components/responses/QueueTicketRejected"})}
+    assert with_403 == {("/shows/{showId}/seats", "get"), ("/seats/{seatId}/hold", "post")}, with_403
+    with_503 = {(p, m) for p, item in spec["paths"].items() for m, op in item.items()
+                if m in ("get", "post") and (op.get("responses") or {}).get("503") == {"$ref": "#/components/responses/QueueUnavailable"}}
+    assert with_503 == {("/shows/{showId}/seats", "get"), ("/seats/{seatId}/hold", "post"),
+                        ("/shows/{showId}/queue", "post"), ("/shows/{showId}/queue/me", "get")}, with_503

@@ -272,4 +272,5 @@ were handed and what counts as done. If you are setting up a world pack for your
 
 ## 보호 장치
 - `.claude/settings.json`의 훅(`scripts/hooks/block_server_test_edits.py`)이 test 자리(`dev-test@tkt`)가 아닌 모든 자리의 `tests/`·`e2e/` Edit·Write를 막는다(신원이 없거나 틀려도 막는다).
+- Claude Code 에이전트 보기·백그라운드 세션(`/background` 등)은 `.claude/settings.json`의 `disableAgentView`로 끈다. 켜면 세션이 공용 데몬으로 옮겨지며 데몬을 띄운 자리의 신원(`OPENRIG_SESSION_NAME`)을 물려받아 큐 기록과 훅 판단이 틀어진다.
 - 훅은 대표 실수를 막는 장치일 뿐 우회될 수 있다(예: Bash 리다이렉션). **최종 확인은 `scripts/verify_tests.py check`로 한다.**

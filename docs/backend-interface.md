@@ -95,3 +95,6 @@ PENDING ────┤
 |---|---|
 | `backend/main.py` `get_now()` | 콜백 판정에도 쓴다. |
 | 환경변수 `MOCK_PG_SECRET` | 콜백 서명 키(기본 `mock-pg-dev-secret`). |
+
+## 가상 대기열·입장권 (9장)
+상세 계약은 `docs/queue.md`. 요점: 좌석맵 조회와 홀드는 `X-User-Id` + 유효한 입장권(`X-Queue-Ticket`)이 필요하고, 입장권 검증이 좌석 캐시·홀드 관문보다 먼저다. 대기열·입장권은 Redis에만 있고, Redis를 쓸 수 없으면(`REDIS_URL` 없음 포함) 503 `QUEUE_UNAVAILABLE`로 우회하지 않는다. 그래서 좌석맵·홀드를 부르는 테스트는 테스트용 Redis(개발 DB 0·`tkt:`와 분리)를 주고, `POST /shows/{id}/queue` → `get_now` 앞당김 → `GET /shows/{id}/queue/me`로 입장권을 얻어 붙인다.

@@ -21,3 +21,14 @@ def api(request):
             a.check_invariants()
     finally:
         a.close()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _api_redis_cleanup():
+    yield
+    try:  # 끝나면 자기 접두사 키만 지운다(개발 Redis·다른 테스트 키는 건드리지 않음)
+        from api_support import API_REDIS_PREFIX
+        from ticket_support import DB_API, delete_prefix, redis_for
+        delete_prefix(redis_for(DB_API), API_REDIS_PREFIX)
+    except Exception:  # noqa: BLE001
+        pass

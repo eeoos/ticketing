@@ -33,3 +33,9 @@
 10. **Given** 사용자 A의 홀드가 만료 전일 때
    **When** A가 같은 좌석을 다시 홀드하면
    **Then** 409 `SEAT_HELD`로 거절되고 홀드는 연장되지 않는다: 이후 A의 결제 요청 응답의 `holdId`·`holdExpiresAt`이 처음 홀드 응답과 같다.
+
+## 9장 변경: 입장권 필요
+홀드는 이제 그 좌석이 속한 공연의 유효한 입장권(`X-Queue-Ticket`)이 있어야 한다(`docs/queue.md`). 위 인수 조건은 유효한 입장권을 붙인 요청 기준이다.
+11. **Given** 입장권이 없거나, 남의 것이거나, 다른 공연의 것이거나, 만료됐을 때 **When** 홀드하면 **Then** 403(`QUEUE_TICKET_REQUIRED`/`INVALID`/`EXPIRED`), Redis 홀드 관문 표시도 DB도 바뀌지 않는다.
+12. **Given** 없는 좌석일 때 **Then** 입장권과 상관없이 404 `NOT_FOUND`.
+13. **Given** Redis를 쓸 수 없을 때 **Then** 503 `QUEUE_UNAVAILABLE`(홀드 관문은 DB로 우회하지만 입장권 검증은 우회하지 않는다).

@@ -158,3 +158,72 @@ def test_us03_contract_nul_in_seat_id_is_404_and_state_unchanged(api):
     assert_error(api.request("POST", f"/seats/{seat}%00/hold", user="A"), 404, "NOT_FOUND")
     assert api.status_of(seat) == "AVAILABLE"
     assert api.hold(seat, user="A").status_code == 201  # 서버가 멀쩡하다
+
+
+# ---- 9장 변경: 홀드는 그 좌석이 속한 공연의 입장권이 필요하다 (US-03 AC11·12) ----
+def _marker_and_cache_untouched(api, seat):
+    from api_support import API_REDIS_PREFIX
+    assert api._redis.exists(f"{API_REDIS_PREFIX}hold:{seat}") == 0, "입장권 거절이 홀드 관문 표시를 남겼다(검증이 관문보다 먼저여야 한다)"
+    assert api.status_of(seat) == "AVAILABLE", "입장권 거절인데 DB 좌석 상태가 바뀌었다"
+
+
+def test_us03_ac11_missing_ticket_is_403_required_and_nothing_changes(api):
+    seat = api.first_seat()
+    assert_error(api.hold(seat, user="A", ticket=None), 403, "QUEUE_TICKET_REQUIRED")
+    _marker_and_cache_untouched(api, seat)
+
+
+def test_us03_ac11_ticket_of_another_user_or_unknown_or_another_show_is_invalid(api):
+    seat = api.first_seat()
+    assert_error(api.hold(seat, user="A", ticket=api.ticket("B")), 403, "QUEUE_TICKET_INVALID")
+    assert_error(api.hold(seat, user="A", ticket="no-such-token"), 403, "QUEUE_TICKET_INVALID")
+    assert_error(api.hold(seat, user="A", ticket=api.ticket("A", show_id="another-show")), 403, "QUEUE_TICKET_INVALID")
+    _marker_and_cache_untouched(api, seat)
+
+
+def test_us03_ac11_expired_ticket_is_403_expired_at_exactly_expiry_and_nothing_changes(api):
+    from datetime import timedelta
+    seat = api.first_seat()
+    ticket = api.ticket("A", ttl=timedelta(minutes=2))
+    api.advance(minutes=2)  # now == expiresAt
+    assert_error(api.hold(seat, user="A", ticket=ticket), 403, "QUEUE_TICKET_EXPIRED")
+    _marker_and_cache_untouched(api, seat)
+
+
+def test_us03_ac11_ticket_valid_one_second_before_expiry_still_holds(api):
+    from datetime import timedelta
+    seat = api.first_seat()
+    ticket = api.ticket("A", ttl=timedelta(minutes=2))
+    api.advance(minutes=1, seconds=59)
+    assert api.hold(seat, user="A", ticket=ticket).status_code == 201
+
+
+def test_us03_ac12_unknown_seat_is_404_regardless_of_the_ticket(api):
+    api.show_id()
+    assert_error(api.hold("no-such-seat", user="A", ticket=None), 404, "NOT_FOUND")  # 입장권 없이도 404
+    assert_error(api.hold("no-such-seat", user="A", ticket="no-such-token"), 404, "NOT_FOUND")
+    assert_error(api.request("POST", "/seats/%00/hold", user="A"), 404, "NOT_FOUND")  # 입력 검증이 입장권보다 먼저
+
+
+def test_us03_ac11_missing_user_header_is_401_before_the_ticket_check(api):
+    seat = api.first_seat()
+    assert_error(api.hold(seat, user=None, ticket=None), 401, "UNAUTHENTICATED")
+    _marker_and_cache_untouched(api, seat)
+
+
+# ---- 없는 좌석 id 로 부르는 요청이 프로세스 메모리를 키우지 않는다 (docs/queue.md: 고정 개수 64 줄무늬 잠금) ----
+def test_us03_contract_unknown_seat_lookups_do_not_accumulate_locks_in_the_process(api):
+    """없는 좌석 id 1000개로 홀드해도(입장권 없이 404 경로) 좌석 조회 잠금 보관이 늘지 않는다.
+    내부 이름에 기대는 테스트: backend.main._SEAT_LOOKUP_LOCKS = 길이 64 의 리스트(server 와 맞춘 이름)."""
+    api.show_id()  # 환경 준비(백엔드 import 포함)
+    from backend import main
+    locks = getattr(main, "_SEAT_LOOKUP_LOCKS", None)
+    assert isinstance(locks, list) and len(locks) == 64, \
+        f"backend.main._SEAT_LOOKUP_LOCKS 가 길이 64 의 리스트여야 한다(고정 개수 줄무늬 잠금): {type(locks).__name__}"
+    assert all(hasattr(lock, "acquire") and hasattr(lock, "release") for lock in locks), "잠금 객체여야 한다"
+    for i in range(1000):
+        assert_error(api.hold(f"no-such-seat-{i}", user="A", ticket=None), 404, "NOT_FOUND")
+    after = main._SEAT_LOOKUP_LOCKS
+    assert isinstance(after, list) and len(after) <= 64, f"없는 좌석 1000개 뒤 잠금 보관이 {len(after)}개로 늘었다"
+    seat = api.first_seat()  # 있는 좌석은 계속 정상 동작
+    assert api.hold(seat, user="A").status_code == 201
