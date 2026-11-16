@@ -374,6 +374,27 @@ def test_us05_ac2_ac6_callback_description_states_state_table_and_server_clock()
         assert word in text, f"콜백 설명에 {word} 가 없다"
 
 
+# ---------- 10장 계약(v0.6.0): HTTP 형식 변경 없이 설명만 추가 ----------
+def one_line(text):
+    return " ".join(text.split())  # YAML 줄바꿈 접힘에 영향받지 않게
+
+
+def test_contract_v0_6_0_info_describes_confirmation_notification_without_http_change():
+    text = one_line(load_spec()["info"].get("description", ""))
+    for phrase in ("확정 알림(10장, docs/events.md)", "outbox", "HTTP 계약 변경 없음"):
+        assert phrase in text, f"info 설명에 '{phrase}' 가 없다"
+
+
+def test_contract_v0_6_0_callback_description_states_when_outbox_event_is_written():
+    spec = load_spec()
+    _, op = path_op(spec, "/payments/callback", "post")
+    text = one_line(op.get("description", ""))
+    for phrase in ("PENDING → CONFIRMED로 바뀌는 그 트랜잭션에서만 BookingConfirmed 이벤트를 outbox에 1줄",
+                   "applied=false, FAILED, REFUND_REQUIRED에는 쓰지 않는다",
+                   "Kafka가 멈춰도 이 응답은 같다"):
+        assert phrase in text, f"콜백 설명에 '{phrase}' 가 없다"
+
+
 # ---------- 공통: 오류 code enum ----------
 ALL_ERROR_CODES = {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD", "HOLD_NOT_OWNED",
                    "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH", "PAYMENT_IN_PROGRESS",
@@ -405,9 +426,9 @@ def raw_response_ref(spec, path, method, code):
     return (op.get("responses") or {}).get(code)
 
 
-def test_contract_version_is_0_5_0_and_mentions_gateway_app_id_header():
+def test_contract_version_is_0_6_0_and_mentions_gateway_app_id_header():
     spec = load_spec()
-    assert spec["info"]["version"] == "0.5.0", spec["info"]["version"]
+    assert spec["info"]["version"] == "0.6.0", spec["info"]["version"]
     assert "X-App-Id" in spec["info"].get("description", ""), "info 설명에 X-App-Id 가 없다"
 
 

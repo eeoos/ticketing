@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Ticketing API
-  version: 0.5.0
+  version: 0.6.0
   description: |
     MVP API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-05,
     예매·좌석 상태 전이와 DB 불변식은 docs/backend-interface.md.
@@ -20,6 +20,8 @@ info:
       Redis가 없거나 멈춰도 상태 코드·오류 code·좌석 상태는 같다.
     - 가상 대기열(9장, docs/queue.md): 공연별 번호표 → 1초마다 200명씩 입장 → 2분짜리 입장권(X-Queue-Ticket).
       좌석맵 조회와 홀드는 입장권이 필요하다. 대기열·입장권 검증은 Redis 장애 때 우회하지 않고 503 QUEUE_UNAVAILABLE.
+    - 확정 알림(10장, docs/events.md): 성공 콜백으로 처음 CONFIRMED가 될 때 같은 트랜잭션에서 outbox 이벤트 1줄.
+      Kafka·알림 처리는 뒤에서 하며 API 응답에 영향이 없다(HTTP 계약 변경 없음).
 
 paths:
   /shows:
@@ -332,6 +334,8 @@ paths:
         | REFUND_REQUIRED   | 변화 없음 (200 applied=false)                        | 409 CALLBACK_CONFLICT     |
         "홀드 유효" = 좌석이 HELD이고, 좌석의 현재 holdId가 예매의 holdId와 같고, now < 그 홀드의 expiresAt.
         같은 콜백이 동시에 여러 번 와도 applied=true는 정확히 한 번이다.
+        PENDING → CONFIRMED로 바뀌는 그 트랜잭션에서만 BookingConfirmed 이벤트를 outbox에 1줄 쓴다(docs/events.md).
+        applied=false, FAILED, REFUND_REQUIRED에는 쓰지 않는다. Kafka가 멈춰도 이 응답은 같다.
       parameters:
         - $ref: "#/components/parameters/MockPgSignature"
       requestBody:

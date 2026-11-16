@@ -403,6 +403,13 @@ def _apply_callback(payment_id: str, result: str, now: datetime):
             (new_status, now, b[0])).fetchone()
         if new_status == "CONFIRMED":
             conn.execute("UPDATE seats SET status = 'SOLD' WHERE id = %s", (b[1],))
+            event_id = str(uuid.uuid4())  # 10장: 같은 트랜잭션에서 outbox 1줄(롤백되면 함께 사라진다)
+            event = {"eventId": event_id, "type": "BookingConfirmed", "version": 1, "occurredAt": _iso(now),
+                     "bookingId": b[0], "showId": seat[3], "seatId": b[1], "userId": b[2], "paymentId": b[4]}
+            conn.execute(
+                """INSERT INTO outbox (event_id, type, booking_id, show_id, user_id, payload, created_at)
+                   VALUES (%s, 'BookingConfirmed', %s, %s, %s, %s, %s)""",
+                (event_id, b[0], seat[3], b[2], Jsonb(event), now))
     if new_status == "CONFIRMED":  # 커밋 뒤: 관문 SOLD 표시 + 좌석맵 캐시 무효화
         cache.mark_sold(b[1], b[2])
         cache.seatmap_invalidate(seat[3])
