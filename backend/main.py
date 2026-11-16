@@ -19,6 +19,33 @@ HOLD_DURATION = timedelta(minutes=5)
 app = FastAPI(title="Ticketing API")
 
 
+class _AppIdHeader:
+    """모든 HTTP 응답(성공·4xx·예외 처리기·처리되지 않은 예외의 500 포함)에 X-App-Id = 환경변수 APP_ID 를 붙인다.
+    ServerErrorMiddleware 보다 바깥에서 감싸야 앱의 500 에도 붙으므로 build_middleware_stack 을 감싼다.
+    APP_ID 가 없으면(로컬 개발·tests/api) 헤더를 붙이지 않는다: 고정 기본값은 어느 앱이 응답했는지 잘못 알려 줄 수 있다."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        app_id = os.environ.get("APP_ID") if scope["type"] == "http" else None
+        if not app_id:
+            return await self.inner(scope, receive, send)
+
+        async def send_with_header(message):
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"x-app-id"]
+                headers.append((b"x-app-id", app_id.encode("latin-1", "replace")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.inner(scope, receive, send_with_header)
+
+
+_build_stack = app.build_middleware_stack
+app.build_middleware_stack = lambda: _AppIdHeader(_build_stack())
+
+
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str):
         self.status, self.code, self.message = status, code, message

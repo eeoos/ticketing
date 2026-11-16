@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Ticketing API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     MVP API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-05,
     예매·좌석 상태 전이와 DB 불변식은 docs/backend-interface.md.
@@ -12,13 +12,17 @@ info:
     - 모든 만료 판단은 서버 시각(get_now)으로 한다. 클라이언트나 콜백이 보낸 시각은 쓰지 않는다.
     - 가격·등급은 범위 밖이다(금액 필드 없음).
     - 시각은 모두 UTC ISO 8601(date-time).
+    - 게이트웨이(7장, docs/infra.md): 클라이언트는 Nginx(8080)로 들어온다. 앱이 처리한 응답에는 헤더 `X-App-Id`(app1|app2|app3)가 붙는다.
+      `X-User-Id`별 초당 5건·burst 10을 넘으면 Nginx가 429 RATE_LIMITED(+ Retry-After)로 답한다(앱 미도달, X-App-Id 없음).
+      앱에 닿지 못하면 502 UPSTREAM_UNAVAILABLE. GET만 Nginx가 다른 앱으로 재시도하고 POST는 재시도하지 않는다
+      — 결제 요청은 같은 Idempotency-Key로 다시 보내면 어느 앱이 받아도 같은 응답이다.
 
 paths:
   /shows:
     get:
       operationId: listShows
       summary: 공연 목록 (US-01)
-      description: 공연이 없으면 빈 배열을 200으로 반환한다. X-User-Id는 필요 없다.
+      description: 공연이 없으면 빈 배열을 200으로 반환한다. X-User-Id는 필요 없다(보내면 그 값으로 게이트웨이 속도 제한을 센다).
       responses:
         "200":
           description: 공연 목록
@@ -28,6 +32,10 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Show"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
 
   /shows/{showId}/seats:
     get:
@@ -45,8 +53,12 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Seat"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "404":
           $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
 
   /seats/{seatId}/hold:
     post:
@@ -66,6 +78,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Hold"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "404":
@@ -143,6 +159,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "403":
@@ -175,6 +195,10 @@ paths:
         - $ref: "#/components/parameters/XUserId"
         - $ref: "#/components/parameters/BookingId"
       responses:
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
         "200":
           description: 예매의 현재 상태
           content:
@@ -234,6 +258,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/UpstreamUnavailable"
         "409":
           description: 이미 다른 최종 결과가 반영된 예매에 반대 결과가 옴. code=CALLBACK_CONFLICT. 아무것도 바뀌지 않는다.
           content:
@@ -295,6 +321,26 @@ components:
             $ref: "#/components/schemas/Error"
     NotFound:
       description: 공연·좌석·예매·결제를 찾을 수 없음. code=NOT_FOUND
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: |
+        게이트웨이(Nginx) 속도 제한. X-User-Id별 초당 5건, burst 10 초과. code=RATE_LIMITED.
+        앱까지 가지 않으므로 상태는 바뀌지 않고 X-App-Id 헤더가 없다. Idempotency-Key도 소비되지 않는다.
+      headers:
+        Retry-After:
+          description: 다시 보내기까지 기다릴 초.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UpstreamUnavailable:
+      description: |
+        게이트웨이가 앱에 닿지 못함. code=UPSTREAM_UNAVAILABLE. POST는 게이트웨이가 재시도하지 않으므로
+        처리 여부가 불확실할 수 있다 — 결제 요청은 같은 Idempotency-Key로 다시 보낸다.
       content:
         application/json:
           schema:
@@ -410,4 +456,6 @@ components:
             - PAYMENT_IN_PROGRESS
             - INVALID_SIGNATURE
             - CALLBACK_CONFLICT
+            - RATE_LIMITED
+            - UPSTREAM_UNAVAILABLE
         message: { type: string }

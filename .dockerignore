@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+.pytest_cache
+.claude
+.codex
+.openrig
+rigs
+tests
+docs
+scripts
+deploy
+*.md

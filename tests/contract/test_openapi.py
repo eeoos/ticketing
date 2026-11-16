@@ -13,6 +13,7 @@ scripts/story_report.py 가 이 이름으로 스토리별 통과표를 만든다
 """
 from pathlib import Path
 
+import pytest
 import yaml
 
 SPEC_PATH = Path(__file__).resolve().parents[2] / "docs" / "openapi.yaml"
@@ -378,7 +379,7 @@ def test_us04_ac12_error_code_enum_has_all_new_codes():
     spec = load_spec()
     expected = {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD", "HOLD_NOT_OWNED",
                 "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH", "PAYMENT_IN_PROGRESS",
-                "INVALID_SIGNATURE", "CALLBACK_CONFLICT"}
+                "INVALID_SIGNATURE", "CALLBACK_CONFLICT", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"}
     assert error_enum(spec) == expected, sorted(error_enum(spec) ^ expected)
 
 
@@ -386,3 +387,64 @@ def test_us04_ac1_old_confirm_flow_is_gone_bookings_201_not_defined():
     spec = load_spec()
     _, op = path_op(spec, "/bookings", "post")
     assert "201" not in responses(spec, op), "결제 요청이 옛 방식(201 바로 확정)으로 남아 있다"
+
+
+# ---------- 7장 계약(v0.3.0): 게이트웨이 응답 429 · 502 ----------
+RATE_LIMITED_PATHS = [("/shows", "get"), ("/shows/{showId}/seats", "get"), ("/seats/{seatId}/hold", "post"),
+                      ("/bookings", "post"), ("/bookings/{bookingId}", "get")]  # X-User-Id 를 받을 수 있는 경로
+ALL_PATHS = RATE_LIMITED_PATHS + [("/payments/callback", "post")]
+
+
+def raw_response_ref(spec, path, method, code):
+    op = spec["paths"][path][method]
+    return (op.get("responses") or {}).get(code)
+
+
+def test_contract_version_is_0_3_0_and_mentions_gateway_app_id_header():
+    spec = load_spec()
+    assert spec["info"]["version"] == "0.3.0", spec["info"]["version"]
+    assert "X-App-Id" in spec["info"].get("description", ""), "info 설명에 X-App-Id 가 없다"
+
+
+@pytest.mark.parametrize("path,method", RATE_LIMITED_PATHS, ids=[f"{m}_{p}" for p, m in RATE_LIMITED_PATHS])
+def test_contract_429_rate_limited_is_defined_on_every_path_that_accepts_user_id(path, method):
+    spec = load_spec()
+    r = raw_response_ref(spec, path, method, "429")
+    assert r == {"$ref": "#/components/responses/RateLimited"}, f"{method.upper()} {path} 의 429 가 RateLimited 가 아니다: {r}"
+
+
+def test_contract_callback_has_no_rate_limit_response():
+    spec = load_spec()
+    assert raw_response_ref(spec, "/payments/callback", "post", "429") is None, "콜백은 속도 제한이 없다(X-User-Id 없음)"
+
+
+@pytest.mark.parametrize("path,method", ALL_PATHS, ids=[f"{m}_{p}" for p, m in ALL_PATHS])
+def test_contract_502_upstream_unavailable_is_defined_on_every_path(path, method):
+    spec = load_spec()
+    r = raw_response_ref(spec, path, method, "502")
+    assert r == {"$ref": "#/components/responses/UpstreamUnavailable"}, f"{method.upper()} {path} 의 502: {r}"
+
+
+def test_contract_rate_limited_response_has_retry_after_header_and_error_body():
+    spec = load_spec()
+    r = resolve(spec, spec["components"]["responses"]["RateLimited"])
+    retry = r["headers"]["Retry-After"]
+    assert retry["schema"]["type"] == "integer" and retry["schema"].get("minimum") == 1, retry
+    schema = resolve(spec, r["content"]["application/json"]["schema"])
+    assert schema is schema_named(spec, "Error") or schema == schema_named(spec, "Error")
+    text = r.get("description", "")
+    assert "RATE_LIMITED" in text and "X-App-Id" in text, "설명에 RATE_LIMITED 와 X-App-Id 없음이 있어야 한다"
+
+
+def test_contract_upstream_unavailable_response_has_error_body_and_idempotency_retry_hint():
+    spec = load_spec()
+    r = resolve(spec, spec["components"]["responses"]["UpstreamUnavailable"])
+    schema = resolve(spec, r["content"]["application/json"]["schema"])
+    assert schema == schema_named(spec, "Error")
+    text = r.get("description", "")
+    assert "UPSTREAM_UNAVAILABLE" in text and "Idempotency-Key" in text, "설명에 코드와 같은 키 재시도 안내가 있어야 한다"
+
+
+def test_contract_gateway_error_codes_are_in_the_error_enum():
+    spec = load_spec()
+    assert {"RATE_LIMITED", "UPSTREAM_UNAVAILABLE"} <= error_enum(spec)

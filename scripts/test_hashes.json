@@ -11,7 +11,11 @@
     "tests/concurrency/concurrency_support.py": "dea81b7f17e9dc2c295e635d66d14a2facd5ca65a6047059a00713dc07384fe6",
     "tests/concurrency/conftest.py": "ac049bfb81f4d097b2266947f3c808c8c63c5aba28173265f66690e6a8cddb50",
     "tests/concurrency/test_concurrent_seat.py": "edb795c347ef14f732ff01d1a0b546ca5b908ab247e5c7637666034b08619c57",
-    "tests/contract/test_openapi.py": "cb0e71d31d89036307c3f9abff068731319ddff0c5119f7c5a40dd49b02e094d",
+    "tests/contract/test_openapi.py": "6a5b5fc6de609ebbe60658efd0df06a995fa4258fb2992f9bd650a2ad5a072cd",
+    "tests/infra/conftest.py": "52c53d98ff79dff8dfed12d596b8c4cddfc0129b322175c31fc9f95cc2f3cc7b",
+    "tests/infra/infra_support.py": "d1d4388c348cc126f6055d7f16cd524428f88c7adf2640aed8cd373b3ab3cfd5",
+    "tests/infra/test_infra_gateway.py": "3ffae7a4171d5b6127b099ceff5b6e9272e8d98c91a031d55fbe233175dad5aa",
+    "tests/infra/test_infra_recovery_units.py": "111bcabb20ae723cd3a189b0514111d7ce245268adfb01c9bbf3a7f8320e8544",
     "tests/test_capacity.py": "b48025404046ca4dd8e57027b4fe0028f3dfc0e652a4ba3e109dec2a1bce41e3",
     "tests/test_smoke.py": "09b57af9eb9c82a19795528b996df79f0a63afe8ae1c75b0ac38fc9b853aa6ad"
   }
