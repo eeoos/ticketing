@@ -6,8 +6,12 @@ x-app: &app
     MOCK_PG_SECRET: ${MOCK_PG_SECRET:-mock-pg-dev-secret}
     WORKERS: "2"
     DB_POOL_MAX_SIZE: "10"   # 3 apps x 2 workers x 10 = 60 <= max_connections 100 (docs/infra.md)
+    REDIS_URL: redis://redis:6379/${APP_REDIS_DB:-0}   # shared by app1~3 (docs/cache.md)
+    REDIS_KEY_PREFIX: ${APP_REDIS_KEY_PREFIX:-tkt:}
   depends_on:
     db:
+      condition: service_healthy
+    redis:
       condition: service_healthy
   restart: "no"
 
@@ -24,6 +28,18 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ticketing -d ticketing"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7.4-alpine
+    # Cache + hold gate only; PostgreSQL is the source of truth, so no persistence.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"   # host access for tests (docs/cache.md)
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 15

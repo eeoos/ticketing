@@ -12,11 +12,13 @@ from fastapi.responses import JSONResponse
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from backend import cache
 from backend.db import app_connection
 
 HOLD_DURATION = timedelta(minutes=5)
 
 app = FastAPI(title="Ticketing API")
+cache.check_config()  # Redis 설정 오류는 시작 시 로그로 남기고 BYPASS
 
 
 class _AppIdHeader:
@@ -47,13 +49,13 @@ app.build_middleware_stack = lambda: _AppIdHeader(_build_stack())
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, headers: dict | None = None):
+        self.status, self.code, self.message, self.headers = status, code, message, headers
 
 
 @app.exception_handler(ApiError)
 async def _api_error(_: Request, exc: ApiError):
-    return JSONResponse({"code": exc.code, "message": exc.message}, status_code=exc.status)
+    return JSONResponse({"code": exc.code, "message": exc.message}, status_code=exc.status, headers=exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -105,22 +107,60 @@ def list_shows():
 def seat_map(show_id: str, now: datetime = Depends(get_now)):
     if _has_nul(show_id):
         raise NOT_FOUND
+    state, body, ver = cache.seatmap_read(show_id, now)  # 버전은 DB 를 읽기 전에 읽어 둔다
+    if state == "HIT":
+        return JSONResponse(body, headers={"X-Cache": "HIT"})
     with app_connection() as conn:
         if not conn.execute("SELECT 1 FROM shows WHERE id = %s", (show_id,)).fetchone():
             raise NOT_FOUND
         rows = conn.execute(
-            """SELECT id, section, row_label, number,
-                      CASE WHEN status = 'HELD' AND hold_expires_at <= %s THEN 'AVAILABLE' ELSE status END
-               FROM seats WHERE show_id = %s ORDER BY section, row_label, number""",
-            (now, show_id),
-        ).fetchall()
-    return [{"id": r[0], "section": r[1], "row": r[2], "number": r[3], "status": r[4]} for r in rows]
+            "SELECT id, section, row_label, number, status, hold_expires_at FROM seats "
+            "WHERE show_id = %s ORDER BY section, row_label, number", (show_id,)).fetchall()
+    body, earliest_hold = [], None
+    for sid, section, row_label, number, status, hold_expires in rows:
+        if status == "HELD":
+            if hold_expires <= now:
+                status = "AVAILABLE"  # 만료된 홀드는 AVAILABLE 로 보인다
+            elif earliest_hold is None or hold_expires < earliest_hold:
+                earliest_hold = hold_expires
+        body.append({"id": sid, "section": section, "row": row_label, "number": number, "status": status})
+    if state == "MISS":
+        # validUntil = min(now + 5초, 응답에 HELD 로 나간 좌석 중 가장 이른 만료). 저장은 버전이 그대로일 때만.
+        valid_until = now + timedelta(seconds=cache.SEATMAP_TTL_S)
+        if earliest_hold is not None:
+            valid_until = min(valid_until, earliest_hold)
+        cache.seatmap_put(show_id, body, valid_until, now, ver)
+    return JSONResponse(body, headers={"X-Cache": state})
 
 
 @app.post("/seats/{seat_id}/hold", status_code=201)
 def hold_seat(seat_id: str, user: str = Depends(require_user), now: datetime = Depends(get_now)):
     if _has_nul(seat_id):
         raise NOT_FOUND
+    token = uuid.uuid4().hex
+    outcome, code = cache.gate(seat_id, user, token, now)  # 입력 검증 뒤, DB 에 가기 전
+    gate_headers = {"X-Hold-Gate": outcome}
+    if outcome == "REJECT":
+        if code == "SEAT_SOLD":
+            raise ApiError(409, "SEAT_SOLD", "이미 판매된 좌석입니다.", gate_headers)
+        raise ApiError(409, "SEAT_HELD", "이미 잡힌 좌석입니다.", gate_headers)
+    try:
+        result = _hold_in_db(seat_id, user, now)
+    except BaseException as e:
+        if outcome == "PASS":
+            cache.gate_release(seat_id, token)  # DB 실패: 내 표시만 되돌림
+        if isinstance(e, ApiError):
+            e.headers = gate_headers
+        raise
+    body, show_id, expires = result
+    # 커밋 뒤: 관문 표시를 DB 만료 시각으로 확정하고 좌석맵 캐시를 지운다.
+    if outcome == "PASS":
+        cache.gate_confirm(seat_id, user, token, now, expires)
+    cache.seatmap_invalidate(show_id)
+    return JSONResponse(body, status_code=201, headers=gate_headers)
+
+
+def _hold_in_db(seat_id: str, user: str, now: datetime):
     expires = now + HOLD_DURATION
     with app_connection() as conn:
         # 조건부 UPDATE: 행 잠금으로 동시 요청이 직렬화되고, 조건을 만족하는 하나만 성공한다.
@@ -128,12 +168,17 @@ def hold_seat(seat_id: str, user: str = Depends(require_user), now: datetime = D
             """UPDATE seats SET status = 'HELD', hold_user_id = %s, hold_expires_at = %s,
                                  hold_id = gen_random_uuid()::text
                WHERE id = %s AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at <= %s))
-               RETURNING id, hold_id""",
+               RETURNING id, hold_id, show_id""",
             (user, expires, seat_id, now),
         ).fetchone()
         if row:
-            return {"holdId": row[1], "seatId": seat_id, "userId": user, "expiresAt": _iso(expires)}
-        cur = conn.execute("SELECT status FROM seats WHERE id = %s", (seat_id,)).fetchone()
+            body = {"holdId": row[1], "seatId": seat_id, "userId": user, "expiresAt": _iso(expires)}
+            result = (body, row[2], expires)
+        else:
+            cur = conn.execute("SELECT status FROM seats WHERE id = %s", (seat_id,)).fetchone()
+            result = None
+    if result:  # with 를 빠져나오며 커밋됨
+        return result
     if not cur:
         raise NOT_FOUND
     if cur[0] == "SOLD":
@@ -278,7 +323,8 @@ def _apply_callback(payment_id: str, result: str, now: datetime):
         if not found:
             raise NOT_FOUND
         seat = conn.execute(  # 잠금 순서: seats → bookings (결제 요청·홀드와 같다)
-            "SELECT status, hold_expires_at, hold_id FROM seats WHERE id = %s FOR UPDATE", (found[0],)).fetchone()
+            "SELECT status, hold_expires_at, hold_id, show_id FROM seats WHERE id = %s FOR UPDATE",
+            (found[0],)).fetchone()
         b = conn.execute(f"SELECT {BOOKING_COLS} FROM bookings WHERE payment_id = %s FOR UPDATE",
                          (payment_id,)).fetchone()
         status = b[3]
@@ -301,4 +347,7 @@ def _apply_callback(payment_id: str, result: str, now: datetime):
             (new_status, now, b[0])).fetchone()
         if new_status == "CONFIRMED":
             conn.execute("UPDATE seats SET status = 'SOLD' WHERE id = %s", (b[1],))
+    if new_status == "CONFIRMED":  # 커밋 뒤: 관문 SOLD 표시 + 좌석맵 캐시 무효화
+        cache.mark_sold(b[1], b[2])
+        cache.seatmap_invalidate(seat[3])
     return {"applied": True, "booking": _booking_body(updated)}

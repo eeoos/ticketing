@@ -400,9 +400,9 @@ def raw_response_ref(spec, path, method, code):
     return (op.get("responses") or {}).get(code)
 
 
-def test_contract_version_is_0_3_0_and_mentions_gateway_app_id_header():
+def test_contract_version_is_0_4_0_and_mentions_gateway_app_id_header():
     spec = load_spec()
-    assert spec["info"]["version"] == "0.3.0", spec["info"]["version"]
+    assert spec["info"]["version"] == "0.4.0", spec["info"]["version"]
     assert "X-App-Id" in spec["info"].get("description", ""), "info 설명에 X-App-Id 가 없다"
 
 
@@ -448,3 +448,60 @@ def test_contract_upstream_unavailable_response_has_error_body_and_idempotency_r
 def test_contract_gateway_error_codes_are_in_the_error_enum():
     spec = load_spec()
     assert {"RATE_LIMITED", "UPSTREAM_UNAVAILABLE"} <= error_enum(spec)
+
+
+# ---------- 8장 계약(v0.4.0): Redis 좌석맵 캐시(X-Cache) · 홀드 관문(X-Hold-Gate) ----
+def test_contract_info_describes_redis_cache_and_gate_headers():
+    spec = load_spec()
+    text = spec["info"].get("description", "")
+    for word in ("Redis", "X-Cache", "X-Hold-Gate", "docs/cache.md"):
+        assert word in text, f"info 설명에 {word} 가 없다"
+
+
+def test_contract_seatmap_200_defines_x_cache_header_enum_hit_miss_bypass():
+    spec = load_spec()
+    r = resolve(spec, spec["paths"]["/shows/{showId}/seats"]["get"]["responses"]["200"])
+    header = r["headers"]["X-Cache"]
+    assert header["schema"]["type"] == "string"
+    assert header["schema"]["enum"] == ["HIT", "MISS", "BYPASS"], header["schema"]
+    desc = header.get("description", "")
+    for word in ("HIT", "MISS", "BYPASS"):
+        assert word in desc, f"X-Cache 설명에 {word} 가 없다"
+
+
+def test_contract_seatmap_description_states_cache_validity_and_invalidation():
+    spec = load_spec()
+    text = spec["paths"]["/shows/{showId}/seats"]["get"].get("description", "")
+    for word in ("최대 5초", "가장 이른 만료", "지워진다", "만료 시각부터는 AVAILABLE"):
+        assert word in text, f"좌석맵 설명에 '{word}' 가 없다"
+
+
+def test_contract_hold_description_states_x_hold_gate_values_409_kept_and_gate_codes_provisional():
+    spec = load_spec()
+    op = spec["paths"]["/seats/{seatId}/hold"]["post"]
+    text = " ".join(op.get("description", "").split())  # 줄바꿈 정규화
+    for word in ("X-Hold-Gate", "PASS", "REJECT", "BYPASS"):
+        assert word in text, f"홀드 설명에 {word} 가 없다"
+    assert "상태 코드(409)와 상태 불변은 같고" in text, "관문 거절도 409·상태 불변이라는 문구가 없다"
+    assert "관문 거절의 code(SEAT_HELD/SEAT_SOLD)는 Redis 표시 근거의 잠정 값" in text, "관문 거절 code 가 잠정 값이라는 문구가 없다"
+    assert "SEAT_SOLD 대신 SEAT_HELD" in text, "드문 SEAT_SOLD→SEAT_HELD 예외 설명이 없다"
+    assert "201·404·409 응답에 진단 헤더 X-Hold-Gate" in text, "X-Hold-Gate 가 붙는 응답 범위(201·404·409)가 없다"
+    assert "401(X-User-Id 없음)은 관문 전에 끝나므로 이 헤더가 없다" in text, "401 에는 헤더가 없다는 문구가 없다"
+    assert "오류 code 계약은 같다" not in text, "옛 문구('오류 code 계약은 같다')가 남아 있다"
+    assert {"201", "401", "404", "409"} <= set(op["responses"]), sorted(op["responses"])
+    assert error_enum(spec) == {"UNAUTHENTICATED", "INVALID_REQUEST", "NOT_FOUND", "SEAT_HELD", "SEAT_SOLD",
+                                "HOLD_NOT_OWNED", "NO_HOLD", "HOLD_EXPIRED", "IDEMPOTENCY_KEY_MISMATCH",
+                                "PAYMENT_IN_PROGRESS", "INVALID_SIGNATURE", "CALLBACK_CONFLICT", "RATE_LIMITED",
+                                "UPSTREAM_UNAVAILABLE"}, "8장에서 오류 code 집합은 바뀌지 않는다"
+
+
+def test_contract_only_seatmap_defines_x_cache_header():
+    spec = load_spec()
+    for path, item in spec["paths"].items():
+        for method, op in item.items():
+            if method not in ("get", "post"):
+                continue
+            for code, resp in (op.get("responses") or {}).items():
+                headers = (resolve(spec, resp) or {}).get("headers") or {}
+                if "X-Cache" in headers:
+                    assert (path, method, code) == ("/shows/{showId}/seats", "get", "200"), (path, method, code)

@@ -14,6 +14,7 @@
 |---|---|---|
 | `db` | `postgres:17-alpine` | 기존 그대로. 호스트 `localhost:5432` |
 | `app1`·`app2`·`app3` | 같은 이미지(`Dockerfile`, 비루트 사용자 `app` uid 10001로 실행), 각자 `APP_ID=app1|app2|app3` | `uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS}`. 컨테이너 안에서만 8000, 호스트에 직접 열지 않음 |
+| `redis` | `redis:7.4-alpine` | 좌석맵 캐시·홀드 관문(`docs/cache.md`). 영속 저장 없음. 호스트 `localhost:6379`(테스트용) |
 | `nginx` | `nginx:1.28-alpine` | 호스트 `8080` → 앱들. 설정 `deploy/nginx/nginx.conf` |
 
 ### 앱 환경변수 (세 앱 공통, `APP_ID`만 다름)
@@ -24,6 +25,8 @@
 | `WORKERS` | `2` |
 | `DB_POOL_MAX_SIZE` | `10` |
 | `APP_ID` | `app1` / `app2` / `app3` |
+| `REDIS_URL` | `redis://redis:6379/${APP_REDIS_DB:-0}` — 세 앱 같은 Redis |
+| `REDIS_KEY_PREFIX` | `${APP_REDIS_KEY_PREFIX:-tkt:}` |
 
 ### DB 연결 예산
 PostgreSQL `max_connections = 100`. 앱 연결 최대치 = 앱 3 × 워커 2 × 풀 10 = **60**. 남는 40은 테스트 fixture·`migrate`/`seed`·psql·샘플러 몫이다. 앱·워커·풀 크기를 바꾸면 이 곱이 80을 넘지 않게 한다.

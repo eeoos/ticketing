@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 import psycopg
+import redis
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -23,6 +24,8 @@ INFRA_DSN = os.environ.get("INFRA_DATABASE_URL", "postgresql://ticketing:ticketi
 BASE_URL = os.environ.get("INFRA_BASE_URL", "http://localhost:8080")
 DEV_DB_NAME = "ticketing"
 APPS = ("app1", "app2", "app3")
+INFRA_REDIS_DB = 3  # 개발 스택은 Redis DB 0·접두사 'tkt:', tests/cache 는 DB 1·2. infra 테스트는 DB 3 에 실행별 접두사
+REDIS_HOST_URL = os.environ.get("INFRA_REDIS_HOST_URL", "redis://localhost:6379")
 
 
 def uid(prefix="u") -> str:
@@ -48,6 +51,7 @@ class Infra:
 
     def __init__(self):
         self._ready = False
+        self.redis_prefix = f"infratest-{uuid.uuid4().hex[:8]}:"
         self._error = None
         self._touched = False
         self.stopped: set[str] = set()
@@ -71,7 +75,9 @@ class Infra:
             migrate.run(INFRA_DSN)
             seed.run(INFRA_DSN)
             self._touched = True  # 이 시점부터는 끝에서 기본 설정으로 되돌린다
-            compose("up", "-d", "--build", "--wait", *APPS, "nginx", env_extra={"APP_DB_NAME": db_name()})
+            compose("up", "-d", "--build", "--wait", *APPS, "nginx",
+                    env_extra={"APP_DB_NAME": db_name(), "APP_REDIS_DB": str(INFRA_REDIS_DB),
+                               "APP_REDIS_KEY_PREFIX": self.redis_prefix})
             self.client = httpx.Client(base_url=BASE_URL, timeout=30)
             self.wait_all_apps_up()
             self._ready = True
@@ -159,7 +165,23 @@ class Infra:
                 problems.append(f"{app}: DATABASE_URL 을 읽지 못했다")
             elif db_name(url) != DEV_DB_NAME:
                 problems.append(f"{app}: DATABASE_URL 이 개발 DB 가 아니다({db_name(url)})")
+            r_url = compose("exec", "-T", app, "printenv", "REDIS_URL", check=False)
+            if r_url.returncode or not r_url.stdout.strip().endswith("/0"):
+                problems.append(f"{app}: REDIS_URL 이 개발 Redis DB 0 으로 돌아오지 않았다({r_url.stdout.strip() or '읽지 못함'})")
+            r_prefix = compose("exec", "-T", app, "printenv", "REDIS_KEY_PREFIX", check=False)
+            if r_prefix.returncode or r_prefix.stdout.strip() != "tkt:":
+                problems.append(f"{app}: REDIS_KEY_PREFIX 가 'tkt:' 로 돌아오지 않았다({r_prefix.stdout.strip() or '읽지 못함'})")
         return problems
+
+    def delete_redis_keys(self):
+        """자기 접두사 키만 지운다(DB 3). Redis 가 없거나 꺼져 있으면 건너뛴다."""
+        try:
+            r = redis.Redis.from_url(f"{REDIS_HOST_URL}/{INFRA_REDIS_DB}", socket_timeout=3)
+            keys = list(r.scan_iter(match=f"{self.redis_prefix}*", count=500))
+            if keys:
+                r.delete(*keys)
+        except redis.RedisError:
+            pass
 
     def finalize(self):
         """세션 끝: 가능한 복구를 모두 시도한 뒤, 하나라도 안 되면 예외로 드러낸다(어느 서비스·설정인지 포함).
@@ -171,7 +193,9 @@ class Infra:
             self.restore_apps()
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))
-        p = compose("up", "-d", "--wait", *APPS, "nginx", drop_env=("APP_DB_NAME",), check=False)
+        self.delete_redis_keys()
+        p = compose("up", "-d", "--wait", *APPS, "nginx",
+                    drop_env=("APP_DB_NAME", "APP_REDIS_DB", "APP_REDIS_KEY_PREFIX"), check=False)
         missing_services = p.returncode and "no such service" in p.stderr  # 구현 전: 되돌릴 서비스 자체가 없다
         if p.returncode and not missing_services:
             errors.append(f"기본 설정 복구(up) 실패: {(p.stdout + p.stderr).strip()[-300:]}")

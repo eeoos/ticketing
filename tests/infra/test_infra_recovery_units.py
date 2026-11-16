@@ -77,3 +77,43 @@ def test_infra_unit_finalize_normal_path_passes(monkeypatch):
 def test_infra_unit_finalize_does_nothing_when_infra_was_never_touched():
     infra = Infra()
     infra.finalize()  # 예외 없음
+
+
+# ---- verify_default_config: 개발 Redis(DB 0, 'tkt:') 복구 확인 (인프라 없이, compose 를 가짜로) ----
+def fake_compose(db_url="postgresql://ticketing:ticketing@db:5432/ticketing", redis_url="redis://redis:6379/0",
+                 prefix="tkt:"):
+    import json
+
+    def fake(*a, **k):
+        if a[0] == "ps":
+            rows = [{"Service": s, "State": "running", "Health": "healthy"} for s in ("app1", "app2", "app3", "nginx")]
+            return cp(0, "\n".join(json.dumps(r) for r in rows))
+        if a[0] == "exec":
+            return cp(0, {"DATABASE_URL": db_url, "REDIS_URL": redis_url, "REDIS_KEY_PREFIX": prefix}[a[-1]] + "\n")
+        return cp()
+    return fake
+
+
+def test_infra_unit_verify_default_config_accepts_dev_defaults(monkeypatch):
+    monkeypatch.setattr(infra_support, "compose", fake_compose())
+    assert Infra().verify_default_config() == []
+
+
+def test_infra_unit_verify_default_config_reports_test_redis_db_and_prefix_left_behind(monkeypatch):
+    monkeypatch.setattr(infra_support, "compose",
+                        fake_compose(redis_url="redis://redis:6379/3", prefix="infratest-1234abcd:"))
+    problems = Infra().verify_default_config()
+    assert sum("REDIS_URL" in p for p in problems) == 3, problems  # 앱 3대 모두
+    assert sum("REDIS_KEY_PREFIX" in p for p in problems) == 3, problems
+
+
+def test_infra_unit_verify_default_config_still_reports_test_database_left_behind(monkeypatch):
+    monkeypatch.setattr(infra_support, "compose",
+                        fake_compose(db_url="postgresql://ticketing:ticketing@db:5432/ticketing_infra"))
+    problems = Infra().verify_default_config()
+    assert sum("DATABASE_URL" in p for p in problems) == 3, problems
+
+
+def test_infra_unit_delete_redis_keys_never_raises_when_redis_is_unreachable(monkeypatch):
+    monkeypatch.setattr(infra_support, "REDIS_HOST_URL", "redis://127.0.0.1:1")
+    Infra().delete_redis_keys()  # 예외 없음

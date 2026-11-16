@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Ticketing API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     MVP API 계약. 요구사항은 docs/PRD.md, 인수 조건은 docs/stories/US-01~US-05,
     예매·좌석 상태 전이와 DB 불변식은 docs/backend-interface.md.
@@ -16,6 +16,8 @@ info:
       `X-User-Id`별 초당 5건·burst 10을 넘으면 Nginx가 429 RATE_LIMITED(+ Retry-After)로 답한다(앱 미도달, X-App-Id 없음).
       앱에 닿지 못하면 502 UPSTREAM_UNAVAILABLE. GET만 Nginx가 다른 앱으로 재시도하고 POST는 재시도하지 않는다
       — 결제 요청은 같은 Idempotency-Key로 다시 보내면 어느 앱이 받아도 같은 응답이다.
+    - Redis(8장, docs/cache.md): 좌석맵 캐시(X-Cache)와 홀드 관문(X-Hold-Gate). Redis는 빠른 길이고 기준은 PostgreSQL이다.
+      Redis가 없거나 멈춰도 상태 코드·오류 code·좌석 상태는 같다.
 
 paths:
   /shows:
@@ -41,12 +43,19 @@ paths:
     get:
       operationId: getSeatMap
       summary: 좌석맵 (US-02)
-      description: 공연의 모든 좌석과 현재 상태. 만료된 홀드는 AVAILABLE로 보인다. X-User-Id는 필요 없다.
+      description: |
+        공연의 모든 좌석과 현재 상태. 만료된 홀드는 AVAILABLE로 보인다. X-User-Id는 필요 없다.
+        캐시 어사이드(docs/cache.md): 최대 5초, 그리고 응답에 HELD로 나간 좌석의 가장 이른 만료 시각을 넘지 않는다.
+        홀드 성공·결제 성공 콜백이 커밋되면 그 공연 캐시는 지워진다. 캐시 응답도 만료 시각부터는 AVAILABLE이다.
       parameters:
         - $ref: "#/components/parameters/ShowId"
       responses:
         "200":
           description: 좌석 목록
+          headers:
+            X-Cache:
+              description: HIT(캐시에서) / MISS(DB에서 계산) / BYPASS(Redis를 쓰지 못해 DB에서 계산).
+              schema: { type: string, enum: [HIT, MISS, BYPASS] }
           content:
             application/json:
               schema:
@@ -68,6 +77,10 @@ paths:
         AVAILABLE 좌석 또는 만료된 HELD 좌석만 잡을 수 있다. 성공할 때마다 새 holdId가 발급된다.
         같은 좌석에 동시에 요청하면 정확히 하나만 201을 받고 나머지는 409(SEAT_HELD)를 받는다.
         본인이 이미 잡은(만료 전) 좌석을 다시 잡아도 409(SEAT_HELD)이며 holdId와 만료 시각은 바뀌지 않는다(연장 없음).
+        Redis 관문(docs/cache.md)이 DB 전에 이미 잡힌 좌석을 409로 돌려보낼 수 있다. 상태 코드(409)와 상태 불변은 같고,
+        관문 거절의 code(SEAT_HELD/SEAT_SOLD)는 Redis 표시 근거의 잠정 값이다(드물게 SEAT_SOLD 대신 SEAT_HELD).
+        201·404·409 응답에 진단 헤더 X-Hold-Gate: PASS(DB까지 감) / REJECT(관문이 거절, DB 미접촉) / BYPASS(관문 미사용).
+        401(X-User-Id 없음)은 관문 전에 끝나므로 이 헤더가 없다.
       parameters:
         - $ref: "#/components/parameters/XUserId"
         - $ref: "#/components/parameters/SeatId"
